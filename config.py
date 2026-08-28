@@ -36,7 +36,10 @@ class Config:
     TAKE_PROFIT_MULTIPLE = float(os.getenv("TAKE_PROFIT_MULTIPLE", "2.0"))
     STOP_LOSS_MULTIPLE = float(os.getenv("STOP_LOSS_MULTIPLE", "0.5"))
     MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+    # Sell delay after buy (seconds) - gives price time to move
     SELL_DELAY_SEC = int(os.getenv("SELL_DELAY_SEC", "30"))
+    # How often (seconds) to re-check price for open positions (TP/SL monitor).
+    PRICE_CHECK_SEC = int(os.getenv("PRICE_CHECK_SEC", "10"))
 
     # Filters
     REQUIRE_SOCIALS = _bool(os.getenv("REQUIRE_SOCIALS", "true"))
