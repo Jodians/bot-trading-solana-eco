@@ -18,6 +18,31 @@ import json
 import httpx
 from config import cfg
 
+def _extract_json(text: str) -> dict | None:
+    """
+    Pull the first balanced JSON object out of arbitrary model output.
+    Handles leading prose, trailing prose, and ```json fences.
+    """
+    if text is None:
+        return None
+    s = text.strip()
+    # Drop a leading ```json / ``` fence
+    if s.startswith("```"):
+        s = s.split("\n", 1)[1] if "\n" in s else s[3:]
+    start = s.find("{")
+    if start == -1:
+        return None
+    # Search for the LAST closing brace after start (models may ramble after JSON)
+    end = s.rfind("}")
+    if end <= start:
+        return None
+    candidate = s[start:end + 1]
+    try:
+        return json.loads(candidate)
+    except Exception:
+        return None
+
+
 _SYSTEM = (
     "You are a strict crypto token-quality screener for a Solana sniper bot. "
     "Given token metadata, judge whether it is likely a legitimate project worth "
@@ -40,13 +65,19 @@ def _build_user_prompt(meta: dict, website_text: str = None) -> str:
         socials.append(f"telegram={meta['telegram']}")
     socials_s = ", ".join(socials) if socials else "NONE"
     text = (
+        "You are a strict crypto token-quality screener for a Solana sniper bot. "
+        "Judge whether this token is likely a legitimate project worth sniping vs a "
+        "scam/rug. Consider real socials, coherent branding, market cap sanity, and "
+        "red flags. Respond ONLY with a JSON object, no prose.\n\n"
         f"Token: {name} ({symbol})\n"
         f"Market cap (USD): {mcap}\n"
         f"Socials: {socials_s}\n"
     )
     if website_text:
         text += f"Website/description snippet:\n{website_text[:1500]}\n"
-    text += "Return JSON verdict now."
+    text += (
+        'Return exactly: {"verdict":"BUY"|"PASS","score":0-100,"reason":"short"}.'
+    )
     return text
 
 
@@ -66,10 +97,12 @@ async def analyze_token(meta: dict, website_text: str = None) -> dict:
         "model": cfg.LLM_MODEL,
         "temperature": 0.2,
         "max_tokens": cfg.LLM_MAX_TOKENS,
+        # Conduit ignores the system role for several models; put instructions in
+        # the user message and force JSON output via response_format.
         "messages": [
-            {"role": "system", "content": _SYSTEM},
             {"role": "user", "content": _build_user_prompt(meta, website_text)},
         ],
+        "response_format": {"type": "json_object"},
     }
     try:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -77,11 +110,11 @@ async def analyze_token(meta: dict, website_text: str = None) -> dict:
             r.raise_for_status()
             data = r.json()
         content = data["choices"][0]["message"]["content"]
-        # Strip code fences if present
-        content = content.strip().strip("`").strip()
-        if content.lower().startswith("json"):
-            content = content[4:].strip()
-        parsed = json.loads(content)
+        # Models sometimes wrap JSON in prose or code fences; extract the first
+        # balanced {...} block instead of trusting the whole string to be JSON.
+        parsed = _extract_json(content)
+        if parsed is None:
+            raise ValueError(f"no JSON object found in LLM output: {content[:120]}")
         verdict = str(parsed.get("verdict", "PASS")).upper()
         score = int(parsed.get("score", 0))
         reason = str(parsed.get("reason", ""))[:200]

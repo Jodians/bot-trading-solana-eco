@@ -53,7 +53,7 @@ class Config:
     LLM_ANALYSIS_ENABLED = _bool(os.getenv("LLM_ANALYSIS_ENABLED", "false"))
     CONDUIT_API_KEY = os.getenv("CONDUIT_API_KEY", "")
     CONDUIT_BASE_URL = os.getenv("CONDUIT_BASE_URL", "https://conduit.ozdoev.net/v1")
-    LLM_MODEL = os.getenv("LLM_MODEL", "anthropic/claude-3.5-sonnet")
+    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
     LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "400"))
     # Minimum score (0-100) for the LLM to allow a BUY.
     LLM_MIN_SCORE = int(os.getenv("LLM_MIN_SCORE", "60"))

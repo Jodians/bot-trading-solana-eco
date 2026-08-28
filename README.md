@@ -43,7 +43,7 @@ fake buy/sell results. Nothing is ever sent to the chain.
 - `config.py` — loads `.env`, validates safety settings.
 - `wallet.py` — loads keypair (live mode only).
 - `filters.py` — on-chain authority/socials/mcap gates.
-- `llm_analysis.py` — optional LLM quality gate via Conduit (Claude) before buy.
+- `llm_analysis.py` — optional LLM quality gate via Conduit (Claude/OpenAI/Gemini models). Default model `gpt-4o`. Note: `claude-opus-*` requires an Elite/Enterprise Conduit plan; reasoning models like `deepseek-r1` ignore `response_format`.
 - `pumpfun_listener.py` — polls pump.fun new-token listing.
 - `jupiter.py` — Jupiter Ultra buy/sell (paper-safe).
 - `snipe.py` — orchestrator + main loop.
