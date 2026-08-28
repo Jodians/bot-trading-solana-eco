@@ -58,6 +58,11 @@ class Config:
     # Minimum score (0-100) for the LLM to allow a BUY.
     LLM_MIN_SCORE = int(os.getenv("LLM_MIN_SCORE", "60"))
 
+    # --- Listener mode ---
+    # Use Helius WebSocket (faster) instead of polling pump.fun listing.
+    # Requires a valid HELIUS_API_KEY. Falls back to polling if false.
+    USE_WEBSOCKET = _bool(os.getenv("USE_WEBSOCKET", "false"))
+
     # pump.fun public listing endpoint (newest tokens)
     PUMPFUN_LISTING_URL = "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created"
 

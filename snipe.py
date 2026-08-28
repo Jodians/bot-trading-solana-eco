@@ -17,9 +17,10 @@ from datetime import datetime
 
 from config import cfg
 from filters import evaluate_token
-from pumpfun_listener import poll_loop
+from pumpfun_listener import poll_loop, fetch_token_meta
 from jupiter import buy_token, sell_token
 from llm_analysis import analyze_token, passed as llm_passed
+from ws_listener import ws_listen
 
 # Simple in-memory position store for paper mode.
 positions = {}
@@ -86,7 +87,14 @@ async def main():
     print("=" * 60)
     if not cfg.LIVE_TRADING:
         print("WARNING: No real trades will be executed (LIVE_TRADING=false).")
-    await poll_loop(handle_new_token, interval_sec=2.0)
+    if cfg.USE_WEBSOCKET:
+        if not cfg.HELIUS_API_KEY or cfg.HELIUS_API_KEY.startswith("your_"):
+            print("ERROR: USE_WEBSOCKET=true but HELIUS_API_KEY missing. Falling back to polling.")
+            cfg.USE_WEBSOCKET = False
+        else:
+            print("Listener: Helius WebSocket (pump.fun logsSubscribe)")
+            await ws_listen(handle_new_token)
+            return
 
 
 if __name__ == "__main__":

@@ -27,6 +27,20 @@ async def fetch_new_tokens(limit: int = 30) -> list[dict]:
     return []
 
 
+async def fetch_token_meta(mint: str) -> dict | None:
+    """
+    Fetch metadata for a single mint from the pump.fun API.
+    Returns the token dict (same shape as fetch_new_tokens items) or None.
+    """
+    url = f"https://frontend-api.pump.fun/coins/{mint}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
+
 async def poll_loop(on_token, interval_sec: float = 2.0, seen: set = None):
     """
     Continuously poll for new tokens and call on_token(meta) for each unseen one.
