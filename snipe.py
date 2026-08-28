@@ -19,6 +19,7 @@ from config import cfg
 from filters import evaluate_token
 from pumpfun_listener import poll_loop
 from jupiter import buy_token, sell_token
+from llm_analysis import analyze_token, passed as llm_passed
 
 # Simple in-memory position store for paper mode.
 positions = {}
@@ -33,6 +34,14 @@ async def handle_new_token(meta: dict):
     if not passed:
         print(f"    -> SKIP ({reason})")
         return
+
+    # Optional LLM quality gate (Conduit). Fail-safe: error => PASS (no buy).
+    if cfg.LLM_ANALYSIS_ENABLED:
+        verdict = await analyze_token(meta)
+        print(f"    -> LLM verdict: {verdict['verdict']} score={verdict['score']} ({verdict['reason']})")
+        if not llm_passed(verdict):
+            print("    -> SKIP (LLM rejected)")
+            return
 
     if len(positions) >= cfg.MAX_OPEN_POSITIONS:
         print("    -> SKIP (max positions reached)")

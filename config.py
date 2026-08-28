@@ -46,6 +46,18 @@ class Config:
     MIN_MARKET_CAP_USD = float(os.getenv("MIN_MARKET_CAP_USD", "500"))
     MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "30000"))
 
+    # --- LLM analysis (optional pre-buy quality gate) ---
+    # Provider: Conduit (OpenAI-compatible chat/completions).
+    # Set LLM_ANALYSIS_ENABLED=true to gate buys on an LLM verdict.
+    # The model is configurable; default is a sane strong model on Conduit.
+    LLM_ANALYSIS_ENABLED = _bool(os.getenv("LLM_ANALYSIS_ENABLED", "false"))
+    CONDUIT_API_KEY = os.getenv("CONDUIT_API_KEY", "")
+    CONDUIT_BASE_URL = os.getenv("CONDUIT_BASE_URL", "https://conduit.ozdoev.net/v1")
+    LLM_MODEL = os.getenv("LLM_MODEL", "anthropic/claude-3.5-sonnet")
+    LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "400"))
+    # Minimum score (0-100) for the LLM to allow a BUY.
+    LLM_MIN_SCORE = int(os.getenv("LLM_MIN_SCORE", "60"))
+
     # pump.fun public listing endpoint (newest tokens)
     PUMPFUN_LISTING_URL = "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created"
 
@@ -70,6 +82,17 @@ class Config:
                     errors.append(f"WALLET_PRIVATE_KEY is not valid base58: {e}")
             if not cls.HELIUS_API_KEY or cls.HELIUS_API_KEY.startswith("your_"):
                 errors.append("LIVE_TRADING=true but HELIUS_API_KEY is missing.")
+        else:
+            # Even in dry-run we warn if wallet key is a placeholder
+            if cls.WALLET_PRIVATE_KEY.startswith("your_"):
+                pass  # fine for paper mode
+
+        # LLM analysis gate must have a key when enabled
+        if cls.LLM_ANALYSIS_ENABLED:
+            if not cls.CONDUIT_API_KEY or cls.CONDUIT_API_KEY.startswith("sk-cdt-your"):
+                errors.append("LLM_ANALYSIS_ENABLED=true but CONDUIT_API_KEY is not set.")
+            if not cls.LLM_MODEL:
+                errors.append("LLM_ANALYSIS_ENABLED=true but LLM_MODEL is empty.")
         else:
             # Even in dry-run we warn if wallet key is a placeholder
             if cls.WALLET_PRIVATE_KEY.startswith("your_"):

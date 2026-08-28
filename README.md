@@ -43,6 +43,7 @@ fake buy/sell results. Nothing is ever sent to the chain.
 - `config.py` — loads `.env`, validates safety settings.
 - `wallet.py` — loads keypair (live mode only).
 - `filters.py` — on-chain authority/socials/mcap gates.
+- `llm_analysis.py` — optional LLM quality gate via Conduit (Claude) before buy.
 - `pumpfun_listener.py` — polls pump.fun new-token listing.
 - `jupiter.py` — Jupiter Ultra buy/sell (paper-safe).
 - `snipe.py` — orchestrator + main loop.
@@ -58,11 +59,27 @@ fake buy/sell results. Nothing is ever sent to the chain.
 ## About "Claude Opus"
 
 The original request asked to build this with Claude Opus. This scaffold was
-written by the Hermes agent (model `tencent/hy3`). If you want the code
-reviewed or extended using Anthropic's Claude Opus, you can run the
-`claude-code` skill/delegation with this repo as the working directory. The
-filter logic here is intentionally LLM-free for speed; you can add an
-Opus-based "token quality analysis" step in `filters.py` later.
+written by the Hermes agent (model `tencent/hy3`). An optional **LLM pre-buy
+analysis** step is wired in via `llm_analysis.py` using **Conduit**
+(OpenAI-compatible endpoint at `conduit.ozdoev.net/v1`) — you can point it at a
+Claude model (e.g. `anthropic/claude-3.5-sonnet`) by setting `LLM_MODEL`.
+
+Enable it in `.env`:
+
+```ini
+LLM_ANALYSIS_ENABLED=true
+CONDUIT_API_KEY=sk-cdt-...your key...
+LLM_MODEL=anthropic/claude-3.5-sonnet
+LLM_MIN_SCORE=60
+```
+
+Behavior: after on-chain filters PASS, the LLM scores the token 0-100. A BUY
+only proceeds if verdict=BUY **and** score >= `LLM_MIN_SCORE`. On any API
+error it FAILS SAFE to "PASS" (no buy), so a broken LLM step never lets a bad
+token through. This analysis runs even in paper mode (it is not a chain action).
+
+You can also run `claude-code` to have Anthropic's Claude Opus review or extend
+this repo as a whole.
 
 ## Legal / ToS
 
