@@ -19,6 +19,14 @@ Cara dapat token:
 import os
 import httpx
 
+# Load .env so TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are picked up even when
+# this module is run directly (python telegram_notify.py) without importing config.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
