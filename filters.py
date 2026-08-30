@@ -112,9 +112,9 @@ async def evaluate_token(meta: dict) -> tuple[bool, str]:
     if cfg.MIN_LIQUIDITY_USD and liq < cfg.MIN_LIQUIDITY_USD:
         return (False, f"liquidity {liq:.0f} < min {cfg.MIN_LIQUIDITY_USD:.0f}")
 
-    txns = int(meta.get("txns_24h") or 0)
-    if cfg.MIN_TXNS_24H and txns < cfg.MIN_TXNS_24H:
-        return (False, f"txns_24h {txns} < min {cfg.MIN_TXNS_24H}")
+    txns = int(meta.get("txns_h1") or meta.get("txns_24h") or 0)
+    if cfg.MIN_TXNS_H1 and txns < cfg.MIN_TXNS_H1:
+        return (False, f"txns_h1 {txns} < min {cfg.MIN_TXNS_H1}")
 
     pchg = float(meta.get("price_change_h1") or 0)
     if cfg.MIN_PRICE_CHANGE_H1_PCT and pchg < cfg.MIN_PRICE_CHANGE_H1_PCT:

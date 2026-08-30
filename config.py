@@ -76,8 +76,9 @@ class Config:
     # --- Advanced quality filters (reduce rug exposure) ---
     # Require a minimum on-chain liquidity (USD). Thin liquidity = easy rug.
     MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "0"))
-    # Require a minimum 24h txn count (bot activity / real interest).
-    MIN_TXNS_24H = int(os.getenv("MIN_TXNS_24H", "0"))
+    # Require a minimum txn count in the LAST HOUR (real interest / momentum).
+    # Token baru pump.fun belum punya history 24h, jadi pakai h1.
+    MIN_TXNS_H1 = int(os.getenv("MIN_TXNS_H1", "0"))
     # Require price to be UP over the last hour (momentum). 0 = no check.
     MIN_PRICE_CHANGE_H1_PCT = float(os.getenv("MIN_PRICE_CHANGE_H1_PCT", "0"))
     # Pair must be at least this many seconds old (skip brand-new, unproven pairs).

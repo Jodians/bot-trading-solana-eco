@@ -14,12 +14,17 @@ import httpx
 from config import cfg
 
 _SYSTEM = (
-    "You are a strict crypto token-quality screener for a Solana sniper bot. "
-    "Given token metadata, judge whether it is likely a legitimate project worth "
-    "sniping vs a scam/rug. Consider: presence of real socials, coherent branding, "
-    "market cap sanity, obviously copycat/spam names, and any red flags. "
-    "Respond ONLY with JSON: {\"verdict\":\"BUY\"|\"PASS\",\"score\":0-100,\"reason\":\"short\"}. "
-    "If you cannot verify legitimacy, return PASS with a low score."
+    "You are a Solana pump.fun SNIPER scanner. Your job is NOT to find 'legit long-term "
+    "projects' — it is to flag tokens that have REAL, OBSERVABLE early momentum and are "
+    "NOT obvious rugs, so a bot can snipe them early. A 'BUY' means: tradable, some real "
+    "interest (socials OR on-chain activity), no blatant scam signals (name/ticker IP "
+    "squatting, tinyurl/redirect website, copy-paste spam). You MAY give BUY to meme tokens "
+    "with thin but real signals — this is speculation, not investing. "
+    "Be pragmatic: a fresh token with a real website + telegram + rising buys is a BUY even "
+    "if the team is anonymous. Only PASS (no buy) when it is an obvious throwaway rug "
+    "(no web presence at all, no activity, name/ticker mismatch scam). "
+    "Score 0-100 = your confidence it is NOT an instant rug. Respond ONLY JSON: "
+    "{\"verdict\":\"BUY\"|\"PASS\",\"score\":0-100,\"reason\":\"short\"}."
 )
 
 

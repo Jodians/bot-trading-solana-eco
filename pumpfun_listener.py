@@ -82,6 +82,8 @@ async def fetch_token_meta(mint: str) -> dict | None:
             "liquidity_usd": (pair.get("liquidity") or {}).get("usd", 0) or 0,
             "txns_24h": (pair.get("txns") or {}).get("h24", {}).get("buys", 0)
             + (pair.get("txns") or {}).get("h24", {}).get("sells", 0),
+            "txns_h1": (pair.get("txns") or {}).get("h1", {}).get("buys", 0)
+            + (pair.get("txns") or {}).get("h1", {}).get("sells", 0),
             "price_change_h1": (pair.get("priceChange") or {}).get("h1", 0) or 0,
             "pair_created_at": pair.get("pairCreatedAt", 0),
         }

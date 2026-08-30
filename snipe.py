@@ -118,14 +118,14 @@ async def monitor_position(mint: str):
                 res = await sell_token(mint, token_amount)
                 print(f"    -> sell result: paper={res.get('paper')}")
                 if tg_enabled():
-                    notify(f"📈 <b>TAKE PROFIT</b> {meta.get('name','?')} @ {multiple:.2f}x (paper={res.get('paper')})")
+                    notify(f"📈 <b>TAKE PROFIT</b> {pos.get('meta', {}).get('name', mint)} @ {multiple:.2f}x (paper={res.get('paper')})")
                 del positions[mint]
             elif decision == "SL":
                 print(f"    -> STOP LOSS @ {multiple:.2f}x -> selling (cut)")
                 res = await sell_token(mint, token_amount)
                 print(f"    -> sell result: paper={res.get('paper')}")
                 if tg_enabled():
-                    notify(f"📉 <b>STOP LOSS</b> {meta.get('name','?')} @ {multiple:.2f}x (paper={res.get('paper')})")
+                    notify(f"📉 <b>STOP LOSS</b> {pos.get('meta', {}).get('name', mint)} @ {multiple:.2f}x (paper={res.get('paper')})")
                 del positions[mint]
             else:
                 await asyncio.sleep(cfg.PRICE_CHECK_SEC)
