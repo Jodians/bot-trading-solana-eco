@@ -58,6 +58,10 @@ class Config:
     CONDUIT_BASE_URL = os.getenv("CONDUIT_BASE_URL", "https://conduit.ozdoev.net/v1")
     LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
     LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "400"))
+    # Secondary provider (fallback kalau primary gagal/403/timeout). Kosongkan = gak pakai fallback.
+    LLM_FALLBACK_BASE_URL = os.getenv("LLM_FALLBACK_BASE_URL", "")
+    LLM_FALLBACK_API_KEY = os.getenv("LLM_FALLBACK_API_KEY", "")
+    LLM_FALLBACK_MODEL = os.getenv("LLM_FALLBACK_MODEL", "")
     # Minimum score (0-100) for the LLM to allow a BUY.
     LLM_MIN_SCORE = int(os.getenv("LLM_MIN_SCORE", "60"))
 
@@ -68,6 +72,16 @@ class Config:
 
     # pump.fun public listing endpoint (newest tokens)
     PUMPFUN_LISTING_URL = "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created"
+
+    # --- Advanced quality filters (reduce rug exposure) ---
+    # Require a minimum on-chain liquidity (USD). Thin liquidity = easy rug.
+    MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "0"))
+    # Require a minimum 24h txn count (bot activity / real interest).
+    MIN_TXNS_24H = int(os.getenv("MIN_TXNS_24H", "0"))
+    # Require price to be UP over the last hour (momentum). 0 = no check.
+    MIN_PRICE_CHANGE_H1_PCT = float(os.getenv("MIN_PRICE_CHANGE_H1_PCT", "0"))
+    # Pair must be at least this many seconds old (skip brand-new, unproven pairs).
+    MIN_PAIR_AGE_SEC = int(os.getenv("MIN_PAIR_AGE_SEC", "0"))
 
     @classmethod
     def validate(cls):

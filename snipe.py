@@ -21,6 +21,7 @@ from pumpfun_listener import poll_loop, fetch_token_meta
 from jupiter import buy_token, sell_token, get_sell_quote
 from llm_analysis import analyze_token, passed as llm_passed
 from ws_listener import ws_listen
+from telegram_notify import notify, enabled as tg_enabled
 
 # In-memory position store: mint -> {bought_at, buy_sol, token_amount, meta}
 positions = {}
@@ -44,6 +45,8 @@ async def handle_new_token(meta: dict):
         print(f"    -> LLM verdict: {verdict['verdict']} score={verdict['score']} ({verdict['reason']})")
         if not llm_passed(verdict):
             print("    -> SKIP (LLM rejected)")
+            if tg_enabled():
+                notify(f"🚫 <b>SKIP (LLM)</b> {name}\n{verdict['reason']}")
             return
 
     if len(positions) >= cfg.MAX_OPEN_POSITIONS:
@@ -54,6 +57,9 @@ async def handle_new_token(meta: dict):
     result = await buy_token(mint, cfg.BUY_AMOUNT_SOL)
     token_amount = result.get("token_amount", 0)
     print(f"    -> buy result: paper={result.get('paper')} tokens={token_amount}")
+    if tg_enabled():
+        mode = "LIVE" if not result.get("paper") else "PAPER"
+        notify(f"✅ <b>BUY ({mode})</b> {name}\n<mute>{mint}</mute>\nSOL: {cfg.BUY_AMOUNT_SOL} | tokens: {token_amount}")
 
     positions[mint] = {
         "bought_at": time.time(),
@@ -111,11 +117,15 @@ async def monitor_position(mint: str):
                 print(f"    -> TAKE PROFIT @ {multiple:.2f}x -> selling")
                 res = await sell_token(mint, token_amount)
                 print(f"    -> sell result: paper={res.get('paper')}")
+                if tg_enabled():
+                    notify(f"📈 <b>TAKE PROFIT</b> {meta.get('name','?')} @ {multiple:.2f}x (paper={res.get('paper')})")
                 del positions[mint]
             elif decision == "SL":
                 print(f"    -> STOP LOSS @ {multiple:.2f}x -> selling (cut)")
                 res = await sell_token(mint, token_amount)
                 print(f"    -> sell result: paper={res.get('paper')}")
+                if tg_enabled():
+                    notify(f"📉 <b>STOP LOSS</b> {meta.get('name','?')} @ {multiple:.2f}x (paper={res.get('paper')})")
                 del positions[mint]
             else:
                 await asyncio.sleep(cfg.PRICE_CHECK_SEC)

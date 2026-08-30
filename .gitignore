@@ -6,3 +6,13 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Runtime artifacts (logs)
+*.log
+push.log
+solana-bot.log
+
+# Test/debug scratch
+_test_*.py
+_dbg.py
+_syntaxcheck.py

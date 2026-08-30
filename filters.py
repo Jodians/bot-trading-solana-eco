@@ -4,6 +4,8 @@ filters.py - Decide whether a freshly detected token is worth sniping.
 We keep this cheap and on-chain-only so it runs fast. Heavy LLM analysis
 (Claude Opus) is OUT of scope here; this is the raw safety/quality gate.
 """
+import time
+
 import httpx
 from config import cfg
 
@@ -104,5 +106,24 @@ async def evaluate_token(meta: dict) -> tuple[bool, str]:
                 return (False, "freeze authority NOT renounced")
         except Exception as e:
             return (False, f"authority check error: {e}")
+
+    # --- Advanced quality filters (reduce rug exposure) ---
+    liq = float(meta.get("liquidity_usd") or 0)
+    if cfg.MIN_LIQUIDITY_USD and liq < cfg.MIN_LIQUIDITY_USD:
+        return (False, f"liquidity {liq:.0f} < min {cfg.MIN_LIQUIDITY_USD:.0f}")
+
+    txns = int(meta.get("txns_24h") or 0)
+    if cfg.MIN_TXNS_24H and txns < cfg.MIN_TXNS_24H:
+        return (False, f"txns_24h {txns} < min {cfg.MIN_TXNS_24H}")
+
+    pchg = float(meta.get("price_change_h1") or 0)
+    if cfg.MIN_PRICE_CHANGE_H1_PCT and pchg < cfg.MIN_PRICE_CHANGE_H1_PCT:
+        return (False, f"price h1 {pchg:.1f}% < min {cfg.MIN_PRICE_CHANGE_H1_PCT:.1f}%")
+
+    created = int(meta.get("pair_created_at") or 0)
+    if cfg.MIN_PAIR_AGE_SEC and created:
+        age = (int(time.time() * 1000) - created) / 1000.0
+        if age < cfg.MIN_PAIR_AGE_SEC:
+            return (False, f"pair too new ({age:.0f}s < {cfg.MIN_PAIR_AGE_SEC}s)")
 
     return (True, "OK")
