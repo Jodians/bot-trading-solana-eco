@@ -1291,7 +1291,6 @@ document.querySelectorAll('.fbtn').forEach(b=>{
       tip.style.opacity = '1';
     }
     function hideTip() { if (tip) tip.style.opacity = '0'; }
-    function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
 
     canvas.addEventListener('pointermove', function (ev) {
       setNdc(ev);
