@@ -22,7 +22,7 @@ from pumpfun_listener import poll_loop, fetch_token_meta
 from jupiter import buy_token, sell_token, get_sell_quote
 from llm_analysis import analyze_token, passed as llm_passed
 from ws_listener import ws_listen
-from telegram_notify import notify, enabled as tg_enabled
+from telegram_notify import notify, enabled as tg_enabled, notify_exit_pnl
 from telemetry import tel
 
 # In-memory position store: mint -> {bought_at, buy_sol, token_amount, meta}
@@ -154,7 +154,7 @@ async def monitor_position(mint: str):
                 print(f"    -> sell result: paper={res.get('paper')}")
                 await tel.emit({"type": "exit_tp", "mint": mint, "name": pos.get("meta", {}).get("name", mint), "multiple": round(multiple, 3), "paper": res.get("paper", True)})
                 if tg_enabled():
-                    notify(f"📈 <b>TAKE PROFIT</b> {pos.get('meta', {}).get('name', mint)} @ {multiple:.2f}x (paper={res.get('paper')})")
+                    notify_exit_pnl(pos.get("meta", {}).get("name", mint), multiple, pos.get("buy_sol", 0.0), "TP")
                 del positions[mint]
             elif decision == "SL":
                 print(f"    -> STOP LOSS @ {multiple:.2f}x -> selling (cut)")
@@ -162,7 +162,7 @@ async def monitor_position(mint: str):
                 print(f"    -> sell result: paper={res.get('paper')}")
                 await tel.emit({"type": "exit_sl", "mint": mint, "name": pos.get("meta", {}).get("name", mint), "multiple": round(multiple, 3), "paper": res.get("paper", True)})
                 if tg_enabled():
-                    notify(f"📉 <b>STOP LOSS</b> {pos.get('meta', {}).get('name', mint)} @ {multiple:.2f}x (paper={res.get('paper')})")
+                    notify_exit_pnl(pos.get("meta", {}).get("name", mint), multiple, pos.get("buy_sol", 0.0), "SL")
                 del positions[mint]
             else:
                 await asyncio.sleep(cfg.PRICE_CHECK_SEC)

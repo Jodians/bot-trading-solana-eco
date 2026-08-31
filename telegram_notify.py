@@ -69,6 +69,64 @@ def enabled() -> bool:
     return _ENABLED
 
 
+def _sol_usd() -> float:
+    """Harga SOL/USD: coba Coingecko (free, no key), fallback ke env SOL_USD."""
+    try:
+        r = httpx.get(
+            "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+            timeout=6,
+        )
+        usd = r.json().get("solana", {}).get("usd")
+        if usd:
+            return float(usd)
+    except Exception:
+        pass
+    try:
+        return float(os.getenv("SOL_USD", "0") or "0")
+    except Exception:
+        return 0.0
+
+
+def notify_exit_pnl(name: str, multiple: float, buy_sol: float, kind: str = "TP") -> bool:
+    """Notif exit (TP/SL) dengan detail P&L: profit/loss dalam SOL + USD.
+
+    kind: 'TP' atau 'SL'. buy_sol = SOL masuk posisi. multiple = sol_out / buy_sol.
+    P&L SOL = (multiple - 1) * buy_sol.  Positif = profit, negatif = loss.
+    """
+    name = name or "?"
+    mult = float(multiple or 0.0)
+    bsol = float(buy_sol or 0.0)
+    pnl_sol = (mult - 1.0) * bsol
+    usd = _sol_usd()
+    pnl_usd = pnl_sol * usd if usd else None
+
+    if kind == "SL":
+        icon, head = "📉", "STOP LOSS"
+    else:
+        icon, head = "📈", "TAKE PROFIT"
+
+    sign = "+" if pnl_sol >= 0 else "−"
+    pnl_sol_txt = f"{sign}{abs(pnl_sol):.4f} SOL"
+    if pnl_usd is not None:
+        usign = "+" if pnl_usd >= 0 else "−"
+        pnl_usd_txt = f"{usign}${abs(pnl_usd):.2f}"
+        usd_line = f"\n💵 <b>P&L:</b> {pnl_usd_txt} USD"
+    else:
+        usd_line = "\n💵 <b>P&L:</b> (SOL price n/a)"
+
+    # bar sederhana utk visualisasi persen
+    pct = (mult - 1.0) * 100.0
+    bar = "🟢" if pnl_sol >= 0 else "🔴"
+
+    text = (
+        f"{icon} <b>{head}</b> {name}\n"
+        f"   x{mult:.2f}  ({'+' if pct>=0 else '−'}{abs(pct):.1f}%)\n"
+        f"   🔹 <b>Entry:</b> {bsol:.4f} SOL\n"
+        f"   🔹 <b>P&L:</b> {pnl_sol_txt}  {bar}{usd_line}"
+    )
+    return notify(text)
+
+
 if __name__ == "__main__":
     # test lokal
     if enabled():
