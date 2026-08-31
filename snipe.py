@@ -12,6 +12,7 @@ By default LIVE_TRADING=false -> buys/sells are paper/dry-run. No real funds
 move. Read config.py / .env.example before enabling live trading.
 """
 import asyncio
+import random
 import time
 from datetime import datetime
 
@@ -83,6 +84,7 @@ async def handle_new_token(meta: dict):
         "bought_at": time.time(),
         "buy_sol": cfg.BUY_AMOUNT_SOL,
         "token_amount": token_amount,
+        "paper": result.get("paper", True),
         "meta": meta,
     }
 
@@ -114,20 +116,32 @@ async def monitor_position(mint: str):
         while mint in positions:
             pos = positions[mint]
             token_amount = pos.get("token_amount", 0)
-            if token_amount <= 0:
-                # No real holding (e.g. paper sim) -> just age out after a while.
-                if time.time() - pos["bought_at"] > 300:
-                    print(f"[{datetime.now():%H:%M:%S}] {mint}: paper sim expired, closing")
-                    del positions[mint]
-                await asyncio.sleep(cfg.PRICE_CHECK_SEC)
-                continue
+            is_paper = pos.get("paper", True)
 
-            sol_out = await get_sell_quote(mint, token_amount)
-            if sol_out is None:
-                await asyncio.sleep(cfg.PRICE_CHECK_SEC)
-                continue
+            if is_paper:
+                # --- PAPER DRY-RUN: no real on-chain holding, so simulate a
+                # price random-walk to exercise TP/SL + the dashboard. This
+                # avoids hitting Jupiter with the dummy paper amount (which
+                # returns HTTP 400) and lets paper positions actually exit. ---
+                if "paper_mult" not in pos:
+                    pos["paper_mult"] = 1.0
+                drift = random.uniform(-0.04, 0.05)
+                pos["paper_mult"] = max(0.05, min(5.0, pos["paper_mult"] + drift))
+                multiple = pos["paper_mult"]
+            else:
+                if token_amount <= 0:
+                    # Real holding but amount unknown -> age out after a while.
+                    if time.time() - pos["bought_at"] > 300:
+                        print(f"[{datetime.now():%H:%M:%S}] {mint}: sim expired, closing")
+                        del positions[mint]
+                    await asyncio.sleep(cfg.PRICE_CHECK_SEC)
+                    continue
+                sol_out = await get_sell_quote(mint, token_amount)
+                if sol_out is None:
+                    await asyncio.sleep(cfg.PRICE_CHECK_SEC)
+                    continue
+                multiple = sol_out / pos["buy_sol"] if pos["buy_sol"] else 0.0
 
-            multiple = sol_out / pos["buy_sol"] if pos["buy_sol"] else 0.0
             decision = decide_exit(multiple)
             print(f"[{datetime.now():%H:%M:%S}] {mint}: now {multiple:.2f}x (TP {cfg.TAKE_PROFIT_MULTIPLE} / SL {cfg.STOP_LOSS_MULTIPLE}) {decision}")
             await tel.emit({"type": "position_tick", "mint": mint,
