@@ -35,7 +35,20 @@ _API = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage" if _ENABLED else "
 
 
 def notify(text: str, parse_mode: str = "HTML") -> bool:
-    """Kirim 1 pesan ke Telegram. Return True kalau terkirim, False kalau no-op/gagal."""
+    """Kirim 1 pesan ke Telegram. Return True kalau terkirim, False kalau no-op/gagal.
+
+    Also emits a `tg` event to the live dashboard telemetry bus (when the
+    dashboard is running) so Telegram alerts show up in the UI feed too.
+    """
+    # Push to dashboard regardless of whether Telegram itself is enabled.
+    try:
+        from telemetry import tel
+        import asyncio
+        asyncio.get_event_loop().create_task(
+            tel.emit({"type": "tg", "text": text[:4000], "ts": __import__("time").time()})
+        )
+    except Exception:
+        pass
     if not _ENABLED:
         return False
     # Telegram batasi 4096 char; potong kalau kepanjangan

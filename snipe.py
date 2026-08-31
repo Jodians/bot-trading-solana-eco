@@ -22,6 +22,7 @@ from jupiter import buy_token, sell_token, get_sell_quote
 from llm_analysis import analyze_token, passed as llm_passed
 from ws_listener import ws_listen
 from telegram_notify import notify, enabled as tg_enabled
+from telemetry import tel
 
 # In-memory position store: mint -> {bought_at, buy_sol, token_amount, meta}
 positions = {}
@@ -33,24 +34,38 @@ async def handle_new_token(meta: dict):
     mint = meta.get("mint")
     name = meta.get("name", "?")
     print(f"[{datetime.now():%H:%M:%S}] new token: {name} ({mint})")
+    await tel.emit({"type": "token_new", "mint": mint, "name": name,
+                    "symbol": meta.get("symbol", ""), "mcap": meta.get("usd_market_cap", 0)})
 
     passed, reason = await evaluate_token(meta)
     if not passed:
         print(f"    -> SKIP ({reason})")
+        await tel.emit({"type": "token_eval", "mint": mint, "name": name,
+                        "passed": False, "reason": reason})
         return
+    await tel.emit({"type": "token_eval", "mint": mint, "name": name,
+                    "passed": True, "reason": reason})
 
     # Optional LLM quality gate (Conduit). Fail-safe: error => PASS (no buy).
     if cfg.LLM_ANALYSIS_ENABLED:
         verdict = await analyze_token(meta)
         print(f"    -> LLM verdict: {verdict['verdict']} score={verdict['score']} ({verdict['reason']})")
+        await tel.emit({"type": "llm", "mint": mint, "name": name,
+                       "verdict": verdict.get("verdict", "?"),
+                       "score": verdict.get("score", 0),
+                       "reason": verdict.get("reason", "")})
         if not llm_passed(verdict):
             print("    -> SKIP (LLM rejected)")
+            await tel.emit({"type": "token_eval", "mint": mint, "name": name,
+                            "passed": False, "reason": f"LLM rejected: {verdict.get('reason', '')}"})
             if tg_enabled():
                 notify(f"🚫 <b>SKIP (LLM)</b> {name}\n{verdict['reason']}")
             return
 
     if len(positions) >= cfg.MAX_OPEN_POSITIONS:
         print("    -> SKIP (max positions reached)")
+        await tel.emit({"type": "token_eval", "mint": mint, "name": name,
+                        "passed": False, "reason": "max positions reached"})
         return
 
     print(f"    -> PASS ({reason}) -> attempting buy (paper={not cfg.LIVE_TRADING})")
@@ -60,6 +75,9 @@ async def handle_new_token(meta: dict):
     if tg_enabled():
         mode = "LIVE" if not result.get("paper") else "PAPER"
         notify(f"✅ <b>BUY ({mode})</b> {name}\n<mute>{mint}</mute>\nSOL: {cfg.BUY_AMOUNT_SOL} | tokens: {token_amount}")
+    await tel.emit({"type": "buy", "mint": mint, "name": name,
+                    "symbol": meta.get("symbol", ""), "sol": cfg.BUY_AMOUNT_SOL,
+                    "paper": result.get("paper", True), "tokens": token_amount})
 
     positions[mint] = {
         "bought_at": time.time(),
@@ -112,11 +130,15 @@ async def monitor_position(mint: str):
             multiple = sol_out / pos["buy_sol"] if pos["buy_sol"] else 0.0
             decision = decide_exit(multiple)
             print(f"[{datetime.now():%H:%M:%S}] {mint}: now {multiple:.2f}x (TP {cfg.TAKE_PROFIT_MULTIPLE} / SL {cfg.STOP_LOSS_MULTIPLE}) {decision}")
+            await tel.emit({"type": "position_tick", "mint": mint,
+                           "name": pos.get("meta", {}).get("name", mint),
+                           "multiple": round(multiple, 3), "decision": decision})
 
             if decision == "TP":
                 print(f"    -> TAKE PROFIT @ {multiple:.2f}x -> selling")
                 res = await sell_token(mint, token_amount)
                 print(f"    -> sell result: paper={res.get('paper')}")
+                await tel.emit({"type": "exit_tp", "mint": mint, "name": pos.get("meta", {}).get("name", mint), "multiple": round(multiple, 3), "paper": res.get("paper", True)})
                 if tg_enabled():
                     notify(f"📈 <b>TAKE PROFIT</b> {pos.get('meta', {}).get('name', mint)} @ {multiple:.2f}x (paper={res.get('paper')})")
                 del positions[mint]
@@ -124,6 +146,7 @@ async def monitor_position(mint: str):
                 print(f"    -> STOP LOSS @ {multiple:.2f}x -> selling (cut)")
                 res = await sell_token(mint, token_amount)
                 print(f"    -> sell result: paper={res.get('paper')}")
+                await tel.emit({"type": "exit_sl", "mint": mint, "name": pos.get("meta", {}).get("name", mint), "multiple": round(multiple, 3), "paper": res.get("paper", True)})
                 if tg_enabled():
                     notify(f"📉 <b>STOP LOSS</b> {pos.get('meta', {}).get('name', mint)} @ {multiple:.2f}x (paper={res.get('paper')})")
                 del positions[mint]

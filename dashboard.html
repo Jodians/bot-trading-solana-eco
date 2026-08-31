@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Solana Sniper · Live Dashboard</title>
+<style>
+  :root{
+    --bg:#070b14; --panel:rgba(20,28,46,.72); --panel-b:rgba(120,160,255,.14);
+    --txt:#e7edff; --muted:#8390b8; --sol:#14f195; --sol2:#9945ff; --purple:#a855f7;
+    --buy:#14f195; --tp:#22d3ee; --sl:#fb7185; --skip:#64748b; --warn:#fbbf24;
+    --radius:16px; --mono:'SF Mono',ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:radial-gradient(1200px 600px at 80% -10%,rgba(153,69,255,.18),transparent 60%),
+       radial-gradient(900px 500px at -10% 10%,rgba(20,241,149,.12),transparent 55%),var(--bg);
+       color:var(--txt);font-family:Inter,Segoe UI,system-ui,sans-serif;min-height:100vh;padding:18px}
+  a{color:var(--tp);text-decoration:none}
+  .wrap{max-width:1320px;margin:0 auto}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+  .logo{width:42px;height:42px;border-radius:12px;background:linear-gradient(135deg,var(--sol),var(--sol2));
+        display:grid;place-items:center;font-weight:800;color:#04110a;font-size:20px;box-shadow:0 0 22px rgba(20,241,149,.45)}
+  h1{font-size:20px;font-weight:800;letter-spacing:.3px}
+  .sub{color:var(--muted);font-size:12.5px;margin-top:2px}
+  .mode{margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .pill{font:600 12px/1 var(--mono);padding:7px 11px;border-radius:999px;border:1px solid var(--panel-b);background:var(--panel)}
+  .pill.live{color:var(--sol);border-color:rgba(20,241,149,.5);box-shadow:0 0 12px rgba(20,241,149,.25)}
+  .pill.paper{color:var(--warn);border-color:rgba(251,191,36,.45)}
+  .btn{cursor:pointer;font:700 12.5px/1 var(--mono);padding:9px 14px;border-radius:10px;border:1px solid var(--panel-b);
+       background:var(--panel);color:var(--txt);transition:.15s}
+  .btn:hover{border-color:var(--sol);color:var(--sol)}
+  .btn.danger:hover{border-color:var(--sl);color:var(--sl)}
+  .kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:14px}
+  .kpi{background:var(--panel);border:1px solid var(--panel-b);border-radius:var(--radius);padding:13px 14px;backdrop-filter:blur(8px)}
+  .kpi .k{font:600 11px/1 var(--mono);color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+  .kpi .v{font:800 22px/1 var(--mono);margin-top:8px}
+  .kpi .v.green{color:var(--sol)} .kpi .v.cyan{color:var(--tp)} .kpi .v.red{color:var(--sl)} .kpi .v.amber{color:var(--warn)}
+  .grid{display:grid;grid-template-columns:1.55fr 1fr;gap:14px}
+  .card{background:var(--panel);border:1px solid var(--panel-b);border-radius:var(--radius);backdrop-filter:blur(8px);overflow:hidden}
+  .card h2{font-size:13px;font-weight:700;padding:13px 16px;border-bottom:1px solid var(--panel-b);
+           display:flex;align-items:center;gap:8px;letter-spacing:.3px}
+  .card h2 .dot{width:8px;height:8px;border-radius:50%;background:var(--sol);box-shadow:0 0 10px var(--sol);animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .body{padding:8px 10px;max-height:560px;overflow-y:auto}
+  .row{display:flex;align-items:center;gap:10px;padding:9px 8px;border-radius:10px;border:1px solid transparent}
+  .row:hover{background:rgba(255,255,255,.03);border-color:var(--panel-b)}
+  .badge{font:700 10.5px/1 var(--mono);padding:4px 7px;border-radius:6px;white-space:nowrap}
+  .b-pass{color:var(--sol);background:rgba(20,241,149,.12)}
+  .b-buy{color:#04110a;background:var(--sol)}
+  .b-skip{color:var(--skip);background:rgba(100,116,139,.16)}
+  .b-tp{color:var(--tp);background:rgba(34,211,238,.13)}
+  .b-sl{color:var(--sl);background:rgba(251,113,133,.13)}
+  .b-llm{color:var(--purple);background:rgba(168,85,247,.14)}
+  .tk{font-weight:700;font-size:13px}
+  .tk small{color:var(--muted);font-weight:500;font-family:var(--mono)}
+  .r-meta{font:11.5px/1.3 var(--mono);color:var(--muted);margin-top:2px}
+  .r-main{flex:1;min-width:0}
+  .grow{flex:1}
+  .filters{display:flex;gap:5px;flex-wrap:wrap}
+  .fbtn{cursor:pointer;font:600 10.5px/1 var(--mono);padding:5px 8px;border-radius:7px;border:1px solid var(--panel-b);background:transparent;color:var(--muted);transition:.15s}
+  .fbtn:hover{color:var(--txt);border-color:var(--sol)}
+  .fbtn.active{color:#04110a;background:var(--sol);border-color:var(--sol)}
+  .line{font:11.5px/1.45 var(--mono);color:var(--muted);padding:2px 0}
+  .pos{display:flex;flex-direction:column;gap:4px;padding:10px 8px;border-radius:10px;border:1px solid var(--panel-b);margin-bottom:8px}
+  .pos .top{display:flex;align-items:center;gap:8px}
+  .mult{font:800 16px/1 var(--mono);margin-left:auto}
+  .spark{width:100%;height:34px;display:block;margin-top:6px}
+  .empty{color:var(--muted);text-align:center;padding:30px 10px;font:13px/1.5 var(--mono)}
+  .connhint{position:fixed;bottom:14px;right:16px;font:11px var(--mono);color:var(--muted);opacity:.8}
+  ::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:rgba(120,160,255,.25);border-radius:8px}
+  @media(max-width:980px){.kpis{grid-template-columns:repeat(3,1fr)}.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">◎</div>
+    <div>
+      <h1>Solana Sniper — Live Dashboard</h1>
+      <div class="sub">Realtime pipeline · pump.fun discovery → filters → LLM gate → paper buy → TP/SL monitor</div>
+    </div>
+    <div class="mode">
+      <span id="modePill" class="pill paper">PAPER</span>
+      <span id="connPill" class="pill">● connect…</span>
+      <button id="pauseBtn" class="btn">Pause bot</button>
+      <button id="clearBtn" class="btn danger">Clear feed</button>
+    </div>
+  </header>
+
+  <div class="kpis">
+    <div class="kpi"><div class="k">Scanned</div><div class="v" id="kScan">0</div></div>
+    <div class="kpi"><div class="k">Passed</div><div class="v green" id="kPass">0</div></div>
+    <div class="kpi"><div class="k">Skipped</div><div class="v" id="kSkip">0</div></div>
+    <div class="kpi"><div class="k">Buys (paper)</div><div class="v cyan" id="kBuy">0</div></div>
+    <div class="kpi"><div class="k">TP / SL</div><div class="v" id="kExit">0 / 0</div></div>
+    <div class="kpi"><div class="k">Realized P&L</div><div class="v amber" id="kPnl">0.000 SOL</div></div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2><span class="dot"></span> Equity Curve (P&L · SOL)
+      <span class="grow"></span>
+      <span id="pnlNow" style="font:800 13px var(--mono);color:var(--sol)">0.000</span>
+    </h2>
+    <div style="padding:10px 12px;position:relative">
+      <canvas id="pnlChart" height="120"></canvas>
+      <div id="pnlTip" style="position:absolute;pointer-events:none;display:none;background:rgba(10,16,28,.95);border:1px solid var(--panel-b);border-radius:8px;padding:6px 9px;font:600 11px/1.4 var(--mono);color:var(--txt);white-space:nowrap;transform:translate(-50%,-115%);z-index:5"></div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2><span class="dot"></span> Token Pipeline (live)
+        <span class="grow"></span>
+        <span class="filters">
+          <button class="fbtn active" data-f="all">All</button>
+          <button class="fbtn" data-f="pass">Pass</button>
+          <button class="fbtn" data-f="buy">Buy</button>
+          <button class="fbtn" data-f="skip">Skip</button>
+          <button class="fbtn" data-f="llm">LLM</button>
+          <button class="fbtn" data-f="tg">TG</button>
+        </span>
+      </h2>
+      <div class="body" id="feed"><div class="empty">Menunggu token terdeteksi…</div></div>
+    </div>
+    <div class="card">
+      <h2><span class="dot"></span> Open Positions</h2>
+      <div class="body" id="positions"><div class="empty">Belum ada posisi terbuka.</div></div>
+    </div>
+  </div>
+</div>
+<div class="connhint" id="hint">ws://localhost:8765</div>
+
+<script>
+const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+// HTTP is served on 8765; the WebSocket stream runs on 8766.
+const WS_PORT = 8766;
+const ws = new WebSocket(`${wsProto}://${location.hostname}:${WS_PORT}`);
+const feedEl = document.getElementById('feed');
+const posEl = document.getElementById('positions');
+const connPill = document.getElementById('connPill');
+const esc = s => (s==null?'':String(s)).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+const shortMint = m => m? (m.slice(0,4)+'…'+m.slice(-4)) : '?';
+
+let stats = {scanned:0,passed:0,skipped:0,buys:0,exits_tp:0,exits_sl:0,realized_pnl_sol:0};
+const posMap = {};
+let feedFilter = 'all';
+
+function renderKPIs(){
+  document.getElementById('kScan').textContent = stats.scanned;
+  document.getElementById('kPass').textContent = stats.passed;
+  document.getElementById('kSkip').textContent = stats.skipped;
+  document.getElementById('kBuy').textContent = stats.buys;
+  document.getElementById('kExit').textContent = `${stats.exits_tp} / ${stats.exits_sl}`;
+  const pnl = stats.realized_pnl_sol||0;
+  const el = document.getElementById('kPnl');
+  el.textContent = (pnl>=0?'+':'') + pnl.toFixed(3) + ' SOL';
+  el.className = 'v ' + (pnl>=0?'green':'red');
+}
+
+function badge(type){
+  const map = {token_new:'b-skip',token_eval:'b-pass',buy:'b-buy',exit_tp:'b-tp',exit_sl:'b-sl',llm:'b-llm',tg:'b-llm',system:'b-skip'};
+  return map[type]||'b-skip';
+}
+function label(type,ev){
+  switch(type){
+    case 'token_new': return 'NEW';
+    case 'token_eval': return ev.passed?'PASS':'SKIP';
+    case 'buy': return 'BUY';
+    case 'exit_tp': return 'TP';
+    case 'exit_sl': return 'SL';
+    case 'llm': return (ev.verdict||'?').toUpperCase();
+    case 'system': return 'SYS';
+    default: return type.toUpperCase();
+  }
+}
+
+function feedCat(ev){
+  switch(ev.type){
+    case 'token_eval': return ev.passed?'pass':'skip';
+    case 'buy': case 'exit_tp': case 'exit_sl': return 'buy';
+    case 'llm': return 'llm';
+    case 'tg': return 'tg';
+    case 'system': return 'skip';
+    default: return 'all';
+  }
+}
+
+function addFeed(ev){
+  const empty = feedEl.querySelector('.empty'); if(empty) empty.remove();
+  const row = document.createElement('div'); row.className='row';
+  row.dataset.cat = feedCat(ev);
+  let meta = '';
+  if(ev.type==='token_new'||ev.type==='token_eval'){ meta = `<div class="r-meta">${ev.reason?esc(ev.reason):''} ${ev.mcap?('· $'+Math.round(ev.mcap).toLocaleString()):''}</div>`; }
+  else if(ev.type==='llm'){ meta = `<div class="r-meta">score ${ev.score??'?'} — ${esc(ev.reason||'')}</div>`; }
+  else if(ev.type==='buy'){ meta = `<div class="r-meta">${ev.paper?'paper':''} ${ev.sol} SOL · ${shortMint(ev.mint)}</div>`; }
+  else if(ev.type==='exit_tp'||ev.type==='exit_sl'){ meta = `<div class="r-meta">${ev.multiple}x · ${shortMint(ev.mint)}</div>`; }
+  else if(ev.type==='tg'){ meta = `<div class="r-meta">${esc((ev.text||'').replace(/<[^>]+>/g,'').slice(0,120))}</div>`; }
+  else if(ev.type==='system'){ meta = `<div class="r-meta">${esc(ev.message||'')}</div>`; }
+  const tk = ev.type==='tg' ? `<span style="color:var(--tp)">✈ Telegram</span>` : `${esc(ev.name||'?')} ${ev.symbol?('<small>$'+esc(ev.symbol)+'</small>'):''}`;
+  row.innerHTML = `
+    <span class="badge ${badge(ev.type)}">${label(ev.type,ev)}</span>
+    <div class="r-main"><div class="tk">${tk}</div>${meta}</div>`;
+  feedEl.prepend(row);
+  if(feedFilter!=='all' && row.dataset.cat!==feedFilter) row.style.display='none';
+  while(feedEl.children.length>120) feedEl.lastChild.remove();
+}
+
+function applyFeedFilter(f){
+  feedFilter = f;
+  document.querySelectorAll('.fbtn').forEach(b=>b.classList.toggle('active', b.dataset.f===f));
+  feedEl.querySelectorAll('.row').forEach(r=>{
+    r.style.display = (f==='all'||r.dataset.cat===f) ? '' : 'none';
+  });
+}
+
+function renderPositions(){
+  const ids = Object.keys(posMap);
+  if(!ids.length){ posEl.innerHTML='<div class="empty">Belum ada posisi terbuka.</div>'; return; }
+  posEl.innerHTML='';
+  for(const id of ids){
+    const p = posMap[id];
+    const m = p.multiple||0;
+    const col = m>=1?'var(--sol)':(m<=0.5?'var(--sl)':'var(--warn)');
+    const pts = (p.history&&p.history.length>1)?p.history:([0,m]);
+    const w=300,h=34, max=Math.max(...pts,2), min=Math.min(...pts,0);
+    const path = pts.map((v,i)=>`${(i/(pts.length-1))*w},${h-((v-min)/((max-min)||1))*h}`).join(' ');
+    const el = document.createElement('div'); el.className='pos';
+    el.innerHTML = `
+      <div class="top">
+        <span class="tk">${esc(p.name||'?')} ${p.symbol?('<small>$'+esc(p.symbol)+'</small>'):''}</span>
+        <span class="mult" style="color:${col}">${m.toFixed(2)}x</span>
+      </div>
+      <div class="r-meta">${shortMint(id)} · buy ${p.buy_sol} SOL · ${p.paper?'PAPER':'LIVE'}${p.decision?(' · '+p.decision):''}</div>
+      <svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+        <polyline points="${path}" fill="none" stroke="${col}" stroke-width="2"/>
+      </svg>`;
+    posEl.appendChild(el);
+  }
+}
+
+function applyStats(d){
+  for(const k in d) if(k in stats) stats[k]=d[k];
+  renderKPIs();
+}
+
+ws.onopen = ()=>{ connPill.textContent='● live'; connPill.classList.add('live'); };
+ws.onclose = ()=>{ connPill.textContent='● disconnected'; connPill.classList.remove('live'); setTimeout(()=>location.reload(),2500); };
+ws.onmessage = (e)=>{
+  const ev = JSON.parse(e.data);
+  if(ev.type==='snapshot'){
+    applyStats(ev.stats||{});
+    posMap = {}; (ev.positions||[]).forEach(p=>posMap[p.mint]=p);
+    feedEl.innerHTML='';
+    (ev.feed||[]).slice().reverse().forEach(addFeed);
+    if(!feedEl.children.length) feedEl.innerHTML='<div class="empty">Belum ada token.</div>';
+    renderPositions();
+    pnlData = (ev.pnl_history||[]).map(p=>[p[0], p[1]]);
+    if(!pnlData.length){ pnlData=[[ev.stats.start_ts||Date.now()/1000,0]]; }
+    if(pnlData.length===1) pnlData.push([pnlData[0][0]+1, pnlData[0][1]]);
+    const lastPnl = pnlData.length ? pnlData[pnlData.length-1][1] : 0;
+    document.getElementById('pnlNow').textContent=(lastPnl>=0?'+':'')+lastPnl.toFixed(3);
+    sizeCanvas(); drawPnl();
+    const mp = document.getElementById('modePill');
+    mp.textContent = (ev.stats&&ev.stats.mode)||'PAPER';
+    mp.className = 'pill ' + ((ev.stats&&ev.stats.mode)==='LIVE'?'live':'paper');
+    return;
+  }
+  // incremental
+  if(ev.type==='token_new'||ev.type==='token_eval'||ev.type==='llm'||ev.type==='buy'||ev.type==='exit_tp'||ev.type==='exit_sl'||ev.type==='tg'||ev.type==='system'){
+    addFeed(ev);
+  }
+  if(ev.type==='token_new') stats.scanned++;
+  else if(ev.type==='token_eval'){ if(ev.passed) stats.passed++; else stats.skipped++; }
+  else if(ev.type==='buy') stats.buys++;
+  else if(ev.type==='exit_tp'){ stats.exits_tp++; posMap[ev.mint]&&delete posMap[ev.mint]; }
+  else if(ev.type==='exit_sl'){ stats.exits_sl++; posMap[ev.mint]&&delete posMap[ev.mint]; }
+  else if(ev.type==='position_tick'){ if(posMap[ev.mint]){ posMap[ev.mint].multiple=ev.multiple; posMap[ev.mint].decision=ev.decision; (posMap[ev.mint].history=posMap[ev.mint].history||[]).push(ev.multiple); renderPositions(); } }
+  else if(ev.type==='pnl'){ addPnl(ev.ts, ev.equity); }
+  else if(ev.type==='system'){ /* pause/resume notice */ }
+  if(['exit_tp','exit_sl','position_tick'].includes(ev.type)===false) renderKPIs();
+  if(ev.type==='exit_tp'||ev.type==='exit_sl'||ev.type==='position_tick') renderKPIs();
+};
+
+const pnlCanvas = document.getElementById('pnlChart');
+const pnlCtx = pnlCanvas.getContext('2d');
+let pnlData = []; // [ts, equity]
+
+function sizeCanvas(){
+  const w = pnlCanvas.clientWidth || 600;
+  const dpr = window.devicePixelRatio || 1;
+  pnlCanvas.width = w * dpr;
+  pnlCanvas.height = 120 * dpr;
+  pnlCtx.setTransform(dpr,0,0,dpr,0,0);
+}
+
+function drawPnl(){
+  const w = pnlCanvas.clientWidth || 600, h = 120;
+  pnlCtx.clearRect(0,0,w,h);
+  if(pnlData.length < 2){
+    pnlCtx.fillStyle = 'rgba(131,144,184,.6)';
+    pnlCtx.font = '12px monospace';
+    pnlCtx.fillText('Menunggu data P&L…', 10, h/2);
+    return;
+  }
+  const vals = pnlData.map(p=>p[1]);
+  let min = Math.min(0, ...vals), max = Math.max(0, ...vals);
+  if(max-min < 1e-9){ max += 0.001; min -= 0.001; }
+  const pad = (max-min)*0.12; min -= pad; max += pad;
+  const xs = pnlData.map((p,i)=> (i/(pnlData.length-1))*w);
+  const ys = vals.map(v=> h - ((v-min)/(max-min))*h);
+  // baseline 0
+  const y0 = h - ((0-min)/(max-min))*h;
+  pnlCtx.strokeStyle = 'rgba(120,160,255,.18)';
+  pnlCtx.lineWidth = 1;
+  pnlCtx.beginPath(); pnlCtx.moveTo(0,y0); pnlCtx.lineTo(w,y0); pnlCtx.stroke();
+  // area fill
+  const last = vals[vals.length-1];
+  const up = last >= 0;
+  const col = up ? '#14f195' : '#fb7185';
+  const grad = pnlCtx.createLinearGradient(0,0,0,h);
+  grad.addColorStop(0, up?'rgba(20,241,149,.35)':'rgba(251,113,133,.35)');
+  grad.addColorStop(1, 'rgba(20,241,149,0)');
+  pnlCtx.beginPath();
+  pnlCtx.moveTo(0, h);
+  for(let i=0;i<xs.length;i++) pnlCtx.lineTo(xs[i], ys[i]);
+  pnlCtx.lineTo(w, h); pnlCtx.closePath();
+  pnlCtx.fillStyle = grad; pnlCtx.fill();
+  // line
+  pnlCtx.beginPath();
+  for(let i=0;i<xs.length;i++){ i?pnlCtx.lineTo(xs[i],ys[i]):pnlCtx.moveTo(xs[i],ys[i]); }
+  pnlCtx.strokeStyle = col; pnlCtx.lineWidth = 2; pnlCtx.stroke();
+  // last dot
+  pnlCtx.beginPath(); pnlCtx.arc(xs[xs.length-1], ys[ys.length-1], 3, 0, Math.PI*2);
+  pnlCtx.fillStyle = col; pnlCtx.fill();
+}
+
+function addPnl(ts, equity){
+  pnlData.push([ts, equity]);
+  if(pnlData.length > 400) pnlData.shift();
+  const el = document.getElementById('pnlNow');
+  el.textContent = (equity>=0?'+':'') + equity.toFixed(3);
+  el.style.color = equity>=0 ? 'var(--sol)' : 'var(--sl)';
+  drawPnl();
+}
+window.addEventListener('resize', ()=>{ sizeCanvas(); drawPnl(); });
+
+// --- P&L chart tooltip ---
+const pnlTip = document.getElementById('pnlTip');
+pnlCanvas.addEventListener('mousemove', (e)=>{
+  if(pnlData.length < 2){ pnlTip.style.display='none'; return; }
+  const rect = pnlCanvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const w = rect.width;
+  const idx = Math.max(0, Math.min(pnlData.length-1, Math.round((x/w)*(pnlData.length-1))));
+  const pt = pnlData[idx];
+  const eq = pt[1];
+  const d = new Date(pt[0]*1000);
+  const tstr = d.toLocaleTimeString();
+  pnlTip.innerHTML = `${tstr}<br>equity <b style="color:${eq>=0?'var(--sol)':'var(--sl)'}">${(eq>=0?'+':'')+eq.toFixed(3)} SOL</b>`;
+  pnlTip.style.left = (x) + 'px';
+  pnlTip.style.top = '8px';
+  pnlTip.style.display = 'block';
+});
+pnlCanvas.addEventListener('mouseleave', ()=>{ pnlTip.style.display='none'; });
+
+document.getElementById('pauseBtn').onclick = ()=>{
+  const paused = connPill.textContent.includes('live');
+  ws.send(JSON.stringify({cmd: ws.__paused?'resume':'pause'}));
+  ws.__paused = !ws.__paused;
+  document.getElementById('pauseBtn').textContent = ws.__paused?'Resume bot':'Pause bot';
+};
+document.getElementById('clearBtn').onclick = ()=>{ ws.send(JSON.stringify({cmd:'clear_feed'})); feedEl.innerHTML='<div class="empty">Feed dikosongkan.</div>'; };
+document.querySelectorAll('.fbtn').forEach(b=>{
+  b.onclick = ()=> applyFeedFilter(b.dataset.f);
+});
+
+</script>
+</body>
+</html>
