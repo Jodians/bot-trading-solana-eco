@@ -6,8 +6,8 @@ We keep this cheap and on-chain-only so it runs fast. Heavy LLM analysis
 """
 import time
 
-import httpx
 from config import cfg
+from rpc import post_rpc
 
 # pump.fun bonding curve program - a token is "pre-graduation" while it still
 # lives on the curve. We approximate by checking the listing metadata flags.
@@ -15,18 +15,20 @@ PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 
 async def get_mint_account_info(mint: str) -> dict:
-    """Fetch mint account data to read mint/freeze authority."""
+    """Fetch mint account data to read mint/freeze authority.
+
+    The commitment level is NOT optional here. At the RPC default (finalized) a
+    mint created seconds ago has no account yet, so this returns value=None and
+    evaluate_token() reports "mint account not found" - a false rejection that
+    only ever fires on the freshest launches. See cfg.RPC_COMMITMENT.
+    """
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "getAccountInfo",
-        "params": [mint, {"encoding": "base64"}],
+        "params": [mint, {"encoding": "base64", "commitment": cfg.RPC_COMMITMENT}],
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(cfg.HELIUS_RPC_URL, json=payload)
-        r.raise_for_status()
-        data = r.json()
-    return data
+    return await post_rpc(payload)
 
 
 def parse_mint_authorities(account_data_b64: str):
@@ -159,10 +161,7 @@ async def check_holder_concentration(mint: str) -> tuple[bool, str]:
     payload = {"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts",
                "params": [mint, {"commitment": "confirmed"}]}
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(cfg.HELIUS_RPC_URL, json=payload)
-            r.raise_for_status()
-            accounts = r.json().get("result", {}).get("value") or []
+        accounts = (await post_rpc(payload)).get("result", {}).get("value") or []
     except Exception as e:
         print(f"    [filter] holder check unavailable ({e}) - allowing")
         return (True, "holder check skipped")

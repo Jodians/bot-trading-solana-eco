@@ -1,5 +1,8 @@
 # Secrets / env
 .env
+# A pre-edit snapshot of .env, so it holds the SAME secrets (Helius key, Telegram
+# token, wallet key). Written by the one-key .env edit script.
+.env.bak
 
 # Python caches
 __pycache__/
@@ -12,6 +15,9 @@ venv/
 push.log
 solana-bot.log
 
+# Supervisor single-instance lock (machine-local)
+run_dashboard.lock
+
 # Runtime state: open positions held by THIS machine's wallet. Machine-specific
 # and privacy-sensitive (reveals holdings) - never commit it.
 positions.json
@@ -21,6 +27,12 @@ positions.json
 _test_*.py
 _dbg.py
 _syntaxcheck.py
+# Throwaway probes (RPC/discovery/event tallies) - written to be deleted
+_*probe*.py
+_e2e_check.py
+_flip_ws.py
+_listener_check.py
+_v3_shape.py
 
 # Local backups / pre-restart snapshots
 *.bak-*

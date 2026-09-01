@@ -44,10 +44,9 @@ only discovers tokens faster.
 """
 import asyncio
 
-import httpx
-
 from config import cfg
 from pumpfun_events import extract_new_mint, has_unknown_event
+from rpc import post_rpc
 
 # pump.fun program id (constant on mainnet)
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -96,10 +95,7 @@ async def _get_transaction(signature: str) -> dict | None:
         "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
         "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}],
     }
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(cfg.HELIUS_RPC_URL, json=payload)
-        r.raise_for_status()
-        return r.json().get("result")
+    return (await post_rpc(payload, timeout=15)).get("result")
 
 
 def _extract_mint(tx: dict) -> str | None:

@@ -994,6 +994,131 @@ async def test_monitor_retries_unconfirmed_sell():
     _clear_store()
 
 
+async def test_authority_lookup_uses_confirmed_commitment():
+    """The bug that produced 2797 of 8957 skips in one live run.
+
+    getAccountInfo without an explicit commitment resolves at "finalized", which
+    lags the chain by ~13s. A mint that is seconds old therefore comes back as
+    value=None and evaluate_token() reports "mint account not found" - a false
+    rejection aimed squarely at the freshest launches. Probed live: every
+    pump.fun coin younger than ~15s was NOT-FOUND at finalized and FOUND at both
+    confirmed and processed.
+    """
+    print("test 9: the authority gate reads accounts at a non-lagging commitment")
+    import filters
+
+    sent = []
+
+    async def fake_post_rpc(payload, timeout=10.0):
+        sent.append(payload)
+        return {"result": {"value": None}}
+
+    real_post = filters.post_rpc
+    filters.post_rpc = fake_post_rpc
+    try:
+        await filters.get_mint_account_info("SomeMint1111111111111111111111111111111111")
+    finally:
+        filters.post_rpc = real_post
+
+    check("one RPC call issued", len(sent) == 1, sent)
+    opts = sent[0]["params"][1] if sent else {}
+    check("commitment is sent explicitly (not the finalized default)",
+          "commitment" in opts, opts)
+    check("commitment is confirmed or processed, never finalized",
+          opts.get("commitment") in ("confirmed", "processed"), opts)
+    check("base64 encoding preserved (the mint parser needs it)",
+          opts.get("encoding") == "base64", opts)
+
+
+async def test_foreign_program_blob_is_not_a_pumpfun_event():
+    """The flood that produced 7358 `enrich queue full` lines.
+
+    Solana flattens inner CPI programs into one log list, so a router or fee hook
+    can drop its own event blob into a pump.fun transaction. Judging every blob
+    in the frame made those look like unrecognised pump.fun events, buying a
+    getTransaction call per trade. Attribution by program id fixes it.
+    """
+    print("test 9b: only pump.fun's own event blobs can trigger the RPC fallback")
+    import base64
+    import pumpfun_events as E
+
+    other = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+
+    # An unrecognised blob emitted by a DIFFERENT program, inside a frame whose
+    # only pump.fun blob is a plain TradeEvent.
+    foreign = [
+        f"Program {E.PUMP_PROGRAM} invoke [1]",
+        "Program data: " + base64.b64encode(E.TRADE_EVENT + os.urandom(96)).decode(),
+        f"Program {other} invoke [2]",
+        "Program data: " + base64.b64encode(os.urandom(48)).decode(),
+        f"Program {other} success",
+        f"Program {E.PUMP_PROGRAM} success",
+    ]
+    check("foreign unknown blob does not flag a launch",
+          not E.has_unknown_event(foreign))
+
+    # Same shape, but pump.fun has NO recognised event of its own: still not a
+    # launch, because the only unknown blob belongs to someone else.
+    foreign_only = [
+        f"Program {E.PUMP_PROGRAM} invoke [1]",
+        f"Program {other} invoke [2]",
+        "Program data: " + base64.b64encode(os.urandom(48)).decode(),
+        f"Program {other} success",
+        f"Program {E.PUMP_PROGRAM} success",
+    ]
+    check("frame with only foreign event data is not a launch",
+          not E.has_unknown_event(foreign_only))
+
+    # An unrecognised blob pump.fun DID emit must still be resolved by RPC:
+    # that is the real "program was upgraded" signal.
+    pump_unknown = [
+        f"Program {E.PUMP_PROGRAM} invoke [1]",
+        "Program data: " + base64.b64encode(os.urandom(48)).decode(),
+        f"Program {E.PUMP_PROGRAM} success",
+    ]
+    check("pump.fun's own unknown blob still flags a possible launch",
+          E.has_unknown_event(pump_unknown))
+
+    # A real create is still decoded (attribution must not break discovery).
+    raw = os.urandom(32)
+    ev = E.extract_new_mint(create_logs(raw, "Attr", "ATR"))
+    check("CreateEvent still decodes with attribution in place",
+          ev is not None and ev["mint"] == E.b58encode(raw), ev)
+
+
+async def test_maintenance_events_are_recognised():
+    """Events pump.fun emits that are not launches must cost zero RPC.
+
+    Sampling live pump.fun transactions found ExtendAccountEvent and
+    CloseUserVolumeAccumulatorEvent among the tags KNOWN_EVENTS did not list, so
+    83% of event-carrying frames looked "possibly a launch".
+    """
+    print("test 9c: pump.fun maintenance events cost no RPC")
+    import base64
+    import pumpfun_events as E
+
+    for name in ("ExtendAccountEvent", "CloseUserVolumeAccumulatorEvent",
+                 "SyncUserVolumeAccumulatorEvent", "CompletePumpAmmMigrationEvent"):
+        tag = E._discriminator(name)
+        check(f"{name} is recognised", tag in E.KNOWN_EVENTS)
+        logs = [
+            f"Program {E.PUMP_PROGRAM} invoke [1]",
+            "Program data: " + base64.b64encode(tag + os.urandom(40)).decode(),
+            f"Program {E.PUMP_PROGRAM} success",
+        ]
+        check(f"{name} frame does not flag a launch", not E.has_unknown_event(logs))
+        check(f"{name} is not decoded as a create",
+              E.extract_new_mint(logs) is None)
+
+    # The tag observed live 25 times with zero creates, whose name we could not
+    # recover. Whitelisted by raw discriminator; assert it stays that way.
+    observed = bytes.fromhex("e2d6f62107f293e5")
+    check("the observed non-create tag is whitelisted", observed in E.KNOWN_EVENTS)
+    check("CreateEvent is not accidentally whitelisted away",
+          E.CREATE_EVENT in E.KNOWN_EVENTS
+          and E.decode_create_event(observed + os.urandom(40)) is None)
+
+
 async def main():
     await test_ws_dedup()
     await test_ws_fallback_rpc()
@@ -1018,6 +1143,9 @@ async def main():
     await test_quote_stays_read_only()
     await test_unconfirmed_swap_is_not_a_fill()
     await test_monitor_retries_unconfirmed_sell()
+    await test_authority_lookup_uses_confirmed_commitment()
+    await test_foreign_program_blob_is_not_a_pumpfun_event()
+    await test_maintenance_events_are_recognised()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")

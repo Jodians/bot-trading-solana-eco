@@ -31,6 +31,7 @@ import httpx
 from solders.transaction import VersionedTransaction
 
 from config import cfg
+from rpc import post_rpc
 from wallet import load_keypair
 
 WSOL = "So11111111111111111111111111111111111111112"
@@ -122,26 +123,24 @@ async def _confirm(signature: str) -> tuple[bool, str]:
         return False, "no signature returned"
     deadline = asyncio.get_event_loop().time() + max(cfg.CONFIRM_TIMEOUT_SEC, 1)
     last = "pending"
-    async with httpx.AsyncClient(timeout=15) as client:
-        while asyncio.get_event_loop().time() < deadline:
-            try:
-                r = await client.post(cfg.HELIUS_RPC_URL, json={
-                    "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
-                    "params": [[signature], {"searchTransactionHistory": True}],
-                })
-                r.raise_for_status()
-                value = (r.json().get("result") or {}).get("value") or [None]
-                st = value[0]
-                if st:
-                    if st.get("err"):
-                        return False, f"tx failed on-chain: {st['err']}"
-                    status = st.get("confirmationStatus") or "processed"
-                    last = status
-                    if status in ("confirmed", "finalized"):
-                        return True, status
-            except Exception as e:
-                last = f"status check error: {e}"
-            await asyncio.sleep(2)
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            body = await post_rpc({
+                "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+                "params": [[signature], {"searchTransactionHistory": True}],
+            }, timeout=15)
+            value = (body.get("result") or {}).get("value") or [None]
+            st = value[0]
+            if st:
+                if st.get("err"):
+                    return False, f"tx failed on-chain: {st['err']}"
+                status = st.get("confirmationStatus") or "processed"
+                last = status
+                if status in ("confirmed", "finalized"):
+                    return True, status
+        except Exception as e:
+            last = f"status check error: {e}"
+        await asyncio.sleep(2)
     return False, f"not confirmed within {cfg.CONFIRM_TIMEOUT_SEC}s (last: {last})"
 
 

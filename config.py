@@ -22,6 +22,34 @@ class Config:
         f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY', '')}",
     )
     JUPITER_ULTRA_URL = os.getenv("JUPITER_ULTRA_URL", "https://lite-api.jup.ag/ultra/v1")
+
+    # Comma-separated RPC endpoints tried in order when the primary returns 429
+    # or 5xx. The Helius free tier exhausts its daily credit fast and then 429s
+    # every getAccountInfo call, which made every token skip with "mint account
+    # not found" / "authority check error" - i.e. discovery looked alive while
+    # the gate was fully blind. Public endpoints have no key and are rate-limited
+    # but sufficient for the read-only authority/holder checks.
+    RPC_FALLBACK_URLS = [
+        u.strip() for u in os.getenv(
+            "RPC_FALLBACK_URLS",
+            "https://api.mainnet-beta.solana.com,https://solana-rpc.publicnode.com",
+        ).split(",") if u.strip()
+    ]
+    # Commitment level for the read-only account lookups behind the safety gates.
+    #
+    # This MUST NOT be left at the RPC default ("finalized"). Finalized lags the
+    # chain by ~13s, so getAccountInfo on a mint that is seconds old returns
+    # value=None - which filters.py reported as "mint account not found" and the
+    # bot counted as a rejection. Measured against the 12 newest pump.fun coins:
+    # every mint younger than ~15s was NOT-FOUND at finalized but FOUND at both
+    # confirmed and processed. That is 31% of all skips in one run (2797/8957),
+    # and it hit exactly the fresh launches a sniper exists to catch.
+    #
+    # "confirmed" is the right level: supermajority-voted, so the account data is
+    # real, while still only ~1-2s behind. "processed" would be faster but can be
+    # rolled back, and we do not want to gate a buy on data that may vanish.
+    RPC_COMMITMENT = os.getenv("RPC_COMMITMENT", "confirmed")
+
     # Slippage tolerance for quotes AND live swaps, in basis points (100 = 1%).
     # 50 bps was hardcoded before; that is far too tight for a fresh pump.fun
     # token and would make most live swaps fail. Paper mode uses the same value
@@ -75,8 +103,19 @@ class Config:
     # Requires a valid HELIUS_API_KEY. Falls back to polling if false.
     USE_WEBSOCKET = _bool(os.getenv("USE_WEBSOCKET", "false"))
 
-    # pump.fun public listing endpoint (newest tokens)
-    PUMPFUN_LISTING_URL = "https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created"
+    # pump.fun public listing endpoint (newest tokens).
+    # NOTE: the old frontend-api.pump.fun host is Cloudflare-blocked (HTTP 530)
+    # for datacenter/bot traffic and never recovers. frontend-api-v3 is the
+    # live host and needs sort=created_timestamp&order=DESC (plain
+    # sort=created is not honoured there).
+    PUMPFUN_LISTING_URL = os.getenv(
+        "PUMPFUN_LISTING_URL",
+        "https://frontend-api-v3.pump.fun/coins"
+        "?offset=0&limit=30&sort=created_timestamp&order=DESC",
+    )
+    PUMPFUN_COIN_URL = os.getenv(
+        "PUMPFUN_COIN_URL", "https://frontend-api-v3.pump.fun/coins"
+    )
 
     # --- Advanced quality filters (reduce rug exposure) ---
     # Require a minimum on-chain liquidity (USD). Thin liquidity = easy rug.

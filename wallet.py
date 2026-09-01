@@ -5,11 +5,11 @@ read its SOL balance.
 Only used for LIVE trading. Paper mode never signs anything, and never needs a
 balance (there are no fees to pay).
 """
-import httpx
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 import base58
 from config import cfg
+from rpc import post_rpc
 
 LAMPORTS = 1_000_000_000
 
@@ -47,13 +47,10 @@ async def get_balance_sol() -> float | None:
         print(f"[wallet] cannot load keypair: {e}")
         return None
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.post(cfg.HELIUS_RPC_URL, json={
-                "jsonrpc": "2.0", "id": 1, "method": "getBalance",
-                "params": [pubkey],
-            })
-            r.raise_for_status()
-            body = r.json()
+        body = await post_rpc({
+            "jsonrpc": "2.0", "id": 1, "method": "getBalance",
+            "params": [pubkey],
+        }, timeout=15)
         if "error" in body:
             print(f"[wallet] getBalance error: {body['error']}")
             return None
