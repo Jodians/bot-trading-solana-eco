@@ -102,7 +102,7 @@
       <span id="pnlNow" style="font:800 13px var(--mono);color:var(--sol)">0.000</span>
     </h2>
     <div style="padding:10px 12px;position:relative">
-      <canvas id="pnlChart" height="120"></canvas>
+      <canvas id="pnlChart" height="120" style="width:100%;height:120px;display:block"></canvas>
       <div id="pnlTip" style="position:absolute;pointer-events:none;display:none;background:rgba(10,16,28,.95);border:1px solid var(--panel-b);border-radius:8px;padding:6px 9px;font:600 11px/1.4 var(--mono);color:var(--txt);white-space:nowrap;transform:translate(-50%,-115%);z-index:5"></div>
     </div>
   </div>
@@ -145,14 +145,14 @@
         <div class="mini-cap">ENERGY</div>
         <svg id="sphereMiniBars" viewBox="0 0 100 24" preserveAspectRatio="none"></svg>
       </div>
-      <!-- legend -->
+      <!-- legend (ordered by pipeline stage, colors match COLORS/LABEL in JS) -->
       <div class="sphere-legend">
-        <span><i style="background:#14f195"></i>lolos</span>
-        <span><i style="background:#fb7185"></i>gagal filter</span>
         <span><i style="background:#a855f7"></i>new</span>
-        <span><i style="background:#22ffa7"></i>buy</span>
-        <span><i style="background:#22d3ee"></i>TP</span>
-        <span><i style="background:#f59e0b"></i>SL</span>
+        <span><i style="background:#14f195"></i>passed</span>
+        <span><i style="background:#fb7185"></i>filtered out</span>
+        <span><i style="background:#22ffa7"></i>bought</span>
+        <span><i style="background:#22d3ee"></i>TP exit</span>
+        <span><i style="background:#f59e0b"></i>SL exit</span>
       </div>
       <!-- tooltip -->
       <div class="sphere-tip" id="sphereTip"></div>
@@ -251,21 +251,12 @@
   var meshes = [];
   var bigNum = 0;
 
-  /* ---------- ws wrap (never create a new socket) ---------- */
-  (function wrapSocket() {
-    var sock = window.ws;
-    if (!sock) return;
-    var original = sock.onmessage;
-    sock.onmessage = function (e) {
-      if (typeof original === 'function') {
-        try { original.call(sock, e); } catch (err) { /* keep host handler isolated */ }
-      }
-      var ev;
-      try { ev = typeof e.data === 'string' ? JSON.parse(e.data) : null; } catch (err) { return; }
-      if (!ev) return;
-      intake(ev);
-    };
-  })();
+  /* ---------- event intake ----------
+     The sphere script runs BEFORE the WebSocket is created (script order in
+     this file), so we cannot wrap window.ws here. Instead we expose a global
+     sink that the ws handler below calls for every event. Events arriving
+     before Three.js finishes initialising are buffered in `queue`. */
+  window.__sphereIntake = function (ev) { intake(ev); };
 
   function intake(ev) {
     if (dead) return;
@@ -859,15 +850,15 @@
           <button class="fbtn" data-f="tg">TG</button>
         </span>
       </h2>
-      <div class="body" id="feed"><div class="empty">Menunggu token terdeteksi…</div></div>
+      <div class="body" id="feed"><div class="empty">Waiting for tokens…</div></div>
     </div>
     <div class="card">
       <h2><span class="dot"></span> Open Positions</h2>
-      <div class="body" id="positions"><div class="empty">Belum ada posisi terbuka.</div></div>
+      <div class="body" id="positions"><div class="empty">No open positions.</div></div>
     </div>
   </div>
 </div>
-<div class="connhint" id="hint">ws://localhost:8765</div>
+<div class="connhint" id="hint">ws://localhost:8766</div>
 
 <script>
 const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -881,7 +872,7 @@ const esc = s => (s==null?'':String(s)).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&g
 const shortMint = m => m? (m.slice(0,4)+'…'+m.slice(-4)) : '?';
 
 let stats = {scanned:0,passed:0,skipped:0,buys:0,exits_tp:0,exits_sl:0,realized_pnl_sol:0};
-const posMap = {};
+let posMap = {};
 let feedFilter = 'all';
 
 function renderKPIs(){
@@ -954,7 +945,7 @@ function applyFeedFilter(f){
 
 function renderPositions(){
   const ids = Object.keys(posMap);
-  if(!ids.length){ posEl.innerHTML='<div class="empty">Belum ada posisi terbuka.</div>'; return; }
+  if(!ids.length){ posEl.innerHTML='<div class="empty">No open positions.</div>'; return; }
   posEl.innerHTML='';
   for(const id of ids){
     const p = posMap[id];
@@ -985,13 +976,17 @@ function applyStats(d){
 ws.onopen = ()=>{ connPill.textContent='● live'; connPill.classList.add('live'); };
 ws.onclose = ()=>{ connPill.textContent='● disconnected'; connPill.classList.remove('live'); setTimeout(()=>location.reload(),2500); };
 ws.onmessage = (e)=>{
-  const ev = JSON.parse(e.data);
+  let ev;
+  try { ev = JSON.parse(e.data); } catch(err){ return; }
+  if(!ev) return;
+  // forward every event to the 3D token sphere (buffers until it is ready)
+  try { window.__sphereIntake && window.__sphereIntake(ev); } catch(err){}
   if(ev.type==='snapshot'){
     applyStats(ev.stats||{});
     posMap = {}; (ev.positions||[]).forEach(p=>posMap[p.mint]=p);
     feedEl.innerHTML='';
     (ev.feed||[]).slice().reverse().forEach(addFeed);
-    if(!feedEl.children.length) feedEl.innerHTML='<div class="empty">Belum ada token.</div>';
+    if(!feedEl.children.length) feedEl.innerHTML='<div class="empty">No tokens yet.</div>';
     renderPositions();
     pnlData = (ev.pnl_history||[]).map(p=>[p[0], p[1]]);
     if(!pnlData.length){ pnlData=[[ev.stats.start_ts||Date.now()/1000,0]]; }
@@ -1038,27 +1033,33 @@ function drawPnl(){
   if(pnlData.length < 2){
     pnlCtx.fillStyle = 'rgba(131,144,184,.6)';
     pnlCtx.font = '12px monospace';
-    pnlCtx.fillText('Menunggu data P&L…', 10, h/2);
+    pnlCtx.fillText('Waiting for P&L data…', 10, h/2);
     return;
   }
   const vals = pnlData.map(p=>p[1]);
-  let min = Math.min(0, ...vals), max = Math.max(0, ...vals);
+  // Scale to the DATA range, not to zero. Forcing 0 into the range squashes the
+  // whole curve against one edge once equity has drifted far from zero (e.g. a
+  // +8 SOL paper run made every wiggle invisible). The zero baseline is still
+  // drawn, but only when it actually falls inside the visible window.
+  let min = Math.min(...vals), max = Math.max(...vals);
   if(max-min < 1e-9){ max += 0.001; min -= 0.001; }
   const pad = (max-min)*0.12; min -= pad; max += pad;
   const xs = pnlData.map((p,i)=> (i/(pnlData.length-1))*w);
   const ys = vals.map(v=> h - ((v-min)/(max-min))*h);
-  // baseline 0
-  const y0 = h - ((0-min)/(max-min))*h;
-  pnlCtx.strokeStyle = 'rgba(120,160,255,.18)';
-  pnlCtx.lineWidth = 1;
-  pnlCtx.beginPath(); pnlCtx.moveTo(0,y0); pnlCtx.lineTo(w,y0); pnlCtx.stroke();
+  // baseline 0 (only if within the visible range)
+  if(0 >= min && 0 <= max){
+    const y0 = h - ((0-min)/(max-min))*h;
+    pnlCtx.strokeStyle = 'rgba(120,160,255,.18)';
+    pnlCtx.lineWidth = 1;
+    pnlCtx.beginPath(); pnlCtx.moveTo(0,y0); pnlCtx.lineTo(w,y0); pnlCtx.stroke();
+  }
   // area fill
   const last = vals[vals.length-1];
   const up = last >= 0;
   const col = up ? '#14f195' : '#fb7185';
   const grad = pnlCtx.createLinearGradient(0,0,0,h);
   grad.addColorStop(0, up?'rgba(20,241,149,.35)':'rgba(251,113,133,.35)');
-  grad.addColorStop(1, 'rgba(20,241,149,0)');
+  grad.addColorStop(1, up?'rgba(20,241,149,0)':'rgba(251,113,133,0)');
   pnlCtx.beginPath();
   pnlCtx.moveTo(0, h);
   for(let i=0;i<xs.length;i++) pnlCtx.lineTo(xs[i], ys[i]);
@@ -1082,6 +1083,15 @@ function addPnl(ts, equity){
   drawPnl();
 }
 window.addEventListener('resize', ()=>{ sizeCanvas(); drawPnl(); });
+// The canvas is laid out by CSS (width:100%), so its pixel width is only known
+// after layout. A ResizeObserver on the wrapper re-syncs the backing store
+// whenever the panel width changes (first paint, window resize, sidebar reflow).
+if(window.ResizeObserver && pnlCanvas.parentElement){
+  new ResizeObserver(()=>{ sizeCanvas(); drawPnl(); }).observe(pnlCanvas.parentElement);
+}
+// Belt-and-braces: re-measure once layout has settled after first paint.
+requestAnimationFrame(()=>{ sizeCanvas(); drawPnl(); });
+window.addEventListener('load', ()=>{ sizeCanvas(); drawPnl(); });
 
 // --- P&L chart tooltip ---
 const pnlTip = document.getElementById('pnlTip');
@@ -1108,279 +1118,10 @@ document.getElementById('pauseBtn').onclick = ()=>{
   ws.__paused = !ws.__paused;
   document.getElementById('pauseBtn').textContent = ws.__paused?'Resume bot':'Pause bot';
 };
-document.getElementById('clearBtn').onclick = ()=>{ ws.send(JSON.stringify({cmd:'clear_feed'})); feedEl.innerHTML='<div class="empty">Feed dikosongkan.</div>'; };
+document.getElementById('clearBtn').onclick = ()=>{ ws.send(JSON.stringify({cmd:'clear_feed'})); feedEl.innerHTML='<div class="empty">Feed cleared.</div>'; };
 document.querySelectorAll('.fbtn').forEach(b=>{
   b.onclick = ()=> applyFeedFilter(b.dataset.f);
 });
-
-
-
-
-    /* -- stable Fibonacci slot table (fixed capacity => stable layout) --- */
-    var SLOTS = (function () {
-      var out = [], ga = Math.PI * (3 - Math.sqrt(5));
-      for (var i = 0; i < MAX_NODES; i++) {
-        var y = 1 - (i / (MAX_NODES - 1)) * 2;
-        var r = Math.sqrt(Math.max(0, 1 - y * y));
-        var th = ga * i;
-        out.push(new THREE.Vector3(Math.cos(th) * r * RADIUS, y * RADIUS, Math.sin(th) * r * RADIUS));
-      }
-      return out;
-    })();
-    var freeSlots = []; for (var si = MAX_NODES - 1; si >= 0; si--) freeSlots.push(si);
-
-    var nodeGeo = new THREE.SphereGeometry(0.42, 20, 16);
-    var ringGeo = new THREE.TorusGeometry(0.85, 0.06, 8, 40);
-    var ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 });
-
-    var nodes = new Map();           // mint -> record
-    var picks = [];                  // raycast targets
-    var selected = null;
-
-    function color(st) { return STATUS_COLORS[st] != null ? STATUS_COLORS[st] : STATUS_COLORS.skip; }
-
-    function releaseOldest() {
-      var it = nodes.keys().next();
-      if (it.done) return;
-      removeNode(it.value);
-    }
-
-    function removeNode(mint) {
-      var rec = nodes.get(mint);
-      if (!rec) return;
-      if (selected === rec) { selected = null; ring.visible = false; }
-      group.remove(rec.mesh);
-      rec.mesh.material.dispose();
-      var i = picks.indexOf(rec.mesh);
-      if (i > -1) picks.splice(i, 1);
-      freeSlots.push(rec.slot);
-      nodes.delete(mint);
-    }
-
-    var ring = new THREE.Mesh(ringGeo, ringMat);
-    ring.visible = false;
-    group.add(ring);
-
-    function refreshCount() { if (counter) counter.textContent = nodes.size + (nodes.size === 1 ? ' token' : ' tokens'); }
-
-    /* -- API ------------------------------------------------------------- */
-    function _addNode(mint, name, symbol, status) {
-      if (!mint) return null;
-      status = STATUS_COLORS[status] ? status : 'new';
-      var rec = nodes.get(mint);
-      if (rec) { _updateNode(mint, status); return rec; }
-
-      if (nodes.size >= MAX_NODES || !freeSlots.length) releaseOldest();
-      var slot = freeSlots.pop();
-      if (slot == null) return null;
-
-      var mat = new THREE.MeshStandardMaterial({
-        color: color(status), emissive: color(status), emissiveIntensity: 0.55,
-        roughness: 0.35, metalness: 0.15
-      });
-      var mesh = new THREE.Mesh(nodeGeo, mat);
-      mesh.position.copy(SLOTS[slot]);
-      mesh.scale.setScalar(0.01);
-
-      rec = {
-        mint: mint,
-        name: name || symbol || 'unknown',
-        symbol: symbol || '?',
-        status: status,
-        slot: slot,
-        mesh: mesh,
-        born: performance.now(),
-        pulse: 1
-      };
-      mesh.userData.mint = mint;
-      group.add(mesh);
-      picks.push(mesh);
-      nodes.set(mint, rec);
-      refreshCount();
-      return rec;
-    }
-
-    function _updateNode(mint, status) {
-      var rec = nodes.get(mint);
-      if (!rec) { return _addNode(mint, null, null, status); }
-      if (!STATUS_COLORS[status]) return rec;
-      rec.status = status;
-      rec.pulse = 1;
-      rec.mesh.material.color.setHex(color(status));
-      rec.mesh.material.emissive.setHex(color(status));
-      // keep recency ordering so recycling drops truly-oldest activity
-      nodes.delete(mint);
-      nodes.set(mint, rec);
-      return rec;
-    }
-
-    function _seedFromSnapshot(feed, positions) {
-      var i, e, st, mint;
-      if (Array.isArray(feed)) {
-        var list = feed.slice(-MAX_NODES);
-        for (i = 0; i < list.length; i++) {
-          e = list[i]; if (!e) continue;
-          mint = e.mint || e.address || e.token; if (!mint) continue;
-          st = normStatus(e) || (STATUS_COLORS[e.status] ? e.status : 'new');
-          var r = _addNode(mint, e.name, e.symbol, st);
-          if (st !== 'new') _updateNode(mint, st);
-          if (r && e.name) { r.name = e.name; }
-          if (r && e.symbol) { r.symbol = e.symbol; }
-        }
-      }
-      if (Array.isArray(positions)) {
-        for (i = 0; i < positions.length; i++) {
-          var p = positions[i]; if (!p) continue;
-          mint = p.mint || p.address || p.token; if (!mint) continue;
-          var rec = nodes.get(mint) || _addNode(mint, p.name, p.symbol, 'buy');
-          if (rec) { if (p.name) rec.name = p.name; if (p.symbol) rec.symbol = p.symbol; }
-          _updateNode(mint, 'buy');
-        }
-      }
-      refreshCount();
-    }
-
-    api.addNode = _addNode;
-    api.updateNode = _updateNode;
-    api.seedFromSnapshot = _seedFromSnapshot;
-    api._ready = true;
-    // drain buffered events (snapshot arrived before Three.js finished loading)
-    var drained = 0;
-    while (api._q.length) {
-      var q = api._q.shift();
-      if (q[0] === 'add') _addNode(q[1], q[2], q[3], q[4]);
-      else if (q[0] === 'upd') _updateNode(q[1], q[2]);
-      else if (q[0] === 'seed') _seedFromSnapshot(q[1], q[2]);
-      drained++;
-    }
-    // seed a few demo nodes so the sphere is never empty on first load
-    if (nodes.size === 0) {
-      var demo = ['new','pass','skip','buy','tp','sl','new','pass','skip','new'];
-      for (var d = 0; d < demo.length; d++) {
-        _addNode('demo' + d, 'TOKEN' + (d + 1), 'T' + (d + 1), demo[d]);
-      }
-    }
-
-    /* -- interaction ----------------------------------------------------- */
-    var ray = new THREE.Raycaster();
-    var ndc = new THREE.Vector2();
-    var mouse = { x: 0, y: 0, inside: false };
-    var hovered = null;
-    var drag = { active: false, x: 0, y: 0, yaw: 0, pitch: 0, moved: false };
-    var spin = { yaw: 0, pitch: 0.18, auto: true };
-
-    function setNdc(ev) {
-      var r = canvas.getBoundingClientRect();
-      mouse.x = ev.clientX - r.left;
-      mouse.y = ev.clientY - r.top;
-      ndc.x = (mouse.x / r.width) * 2 - 1;
-      ndc.y = -(mouse.y / r.height) * 2 + 1;
-    }
-
-    function pick() {
-      ray.setFromCamera(ndc, camera);
-      var hits = ray.intersectObjects(picks, false);
-      return hits.length ? nodes.get(hits[0].object.userData.mint) : null;
-    }
-
-    function showTip(rec) {
-      if (!tip) return;
-      tip.innerHTML = '<b>' + esc(rec.name) + '</b> <span>' + esc(rec.symbol) + '</span><br><span>' + esc(STATUS_LABELS[rec.status] || rec.status) + '</span>';
-      tip.style.left = mouse.x + 'px';
-      tip.style.top = mouse.y + 'px';
-      tip.style.opacity = '1';
-    }
-    function hideTip() { if (tip) tip.style.opacity = '0'; }
-
-    canvas.addEventListener('pointermove', function (ev) {
-      setNdc(ev);
-      mouse.inside = true;
-      if (drag.active) {
-        drag.moved = drag.moved || Math.abs(ev.clientX - drag.x) + Math.abs(ev.clientY - drag.y) > 3;
-        spin.yaw = drag.yaw + (ev.clientX - drag.x) * 0.006;
-        spin.pitch = Math.max(-1.2, Math.min(1.2, drag.pitch + (ev.clientY - drag.y) * 0.005));
-        return;
-      }
-      hovered = pick();
-      canvas.classList.toggle('is-hit', !!hovered);
-      if (hovered) showTip(hovered); else hideTip();
-    });
-
-    canvas.addEventListener('pointerleave', function () {
-      mouse.inside = false; hovered = null; hideTip();
-      canvas.classList.remove('is-hit');
-    });
-
-    canvas.addEventListener('pointerdown', function (ev) {
-      setNdc(ev);
-      drag.active = true; drag.moved = false;
-      drag.x = ev.clientX; drag.y = ev.clientY; drag.yaw = spin.yaw; drag.pitch = spin.pitch;
-      spin.auto = false;
-      canvas.style.cursor = 'grabbing';
-      if (canvas.setPointerCapture) { try { canvas.setPointerCapture(ev.pointerId); } catch (e) {} }
-    });
-
-    canvas.addEventListener('pointerup', function (ev) {
-      drag.active = false;
-      canvas.style.cursor = '';
-      if (!drag.moved) {
-        setNdc(ev);
-        var rec = pick();
-        selected = (rec && selected !== rec) ? rec : null;
-        ring.visible = !!selected;
-        if (selected) showTip(selected);
-      }
-      setTimeout(function () { spin.auto = true; }, 1400);
-    });
-
-    canvas.addEventListener('wheel', function (ev) {
-      ev.preventDefault();
-      camera.position.z = Math.max(18, Math.min(64, camera.position.z + (ev.deltaY > 0 ? 1.8 : -1.8)));
-    }, { passive: false });
-
-    /* -- resize ---------------------------------------------------------- */
-    function resize() {
-      var w = wrap.clientWidth || W, h = wrap.clientHeight || H;
-      if (!w || !h) return;
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-      renderer.setSize(w, h, false);
-    }
-    if (window.ResizeObserver) new ResizeObserver(resize).observe(wrap);
-    window.addEventListener('resize', resize);
-    resize();
-
-    /* -- loop ------------------------------------------------------------ */
-    var last = performance.now();
-    (function loop(now) {
-      var dt = Math.min(0.05, (now - last) / 1000); last = now;
-
-      if (spin.auto && !drag.active) spin.yaw += dt * 0.16;
-      group.rotation.y = spin.yaw;
-      group.rotation.x = spin.pitch * 0.35;
-
-      nodes.forEach(function (rec) {
-        var s = rec.mesh.scale.x;
-        var target = 1 + (rec === selected ? 0.5 : 0) + (rec === hovered ? 0.3 : 0);
-        rec.mesh.scale.setScalar(s + (target - s) * Math.min(1, dt * 8));
-        if (rec.pulse > 0) {
-          rec.pulse = Math.max(0, rec.pulse - dt * 1.1);
-          rec.mesh.material.emissiveIntensity = 0.55 + rec.pulse * 1.6;
-        }
-      });
-
-      if (selected && nodes.has(selected.mint)) {
-        ring.position.copy(selected.mesh.position);
-        ring.lookAt(camera.position.clone().applyMatrix4(new THREE.Matrix4().copy(group.matrixWorld).invert()));
-        ring.rotation.z += dt * 1.4;
-        ring.visible = true;
-      } else { ring.visible = false; selected = null; }
-
-      renderer.render(scene, camera);
-      requestAnimationFrame(loop);
-    })(last);
-  }
-})();
 </script>
 </body>
 </html>

@@ -22,6 +22,25 @@ from config import cfg
 # pump.fun program id (constant on mainnet)
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
+# Dedup budgets for ws_listen (bounded so a long run cannot leak memory).
+MAX_SEEN_MINTS = 5_000
+MAX_SEEN_SIGS = 20_000
+# Consecutive create-filter misses tolerated before assuming the log format changed.
+CREATE_PROBE_N = 400
+
+
+def _redact(url: str) -> str:
+    """Strip the query string so an API key never lands in stdout/logs."""
+    return url.split("?")[0] + ("?api-key=***" if "?" in url else "")
+
+
+def _remember(store: set, key: str, cap: int):
+    """Bounded membership set: drop an arbitrary half when the cap is hit."""
+    store.add(key)
+    if len(store) > cap:
+        for _ in range(cap // 2):
+            store.pop()
+
 
 async def _fetch_token_meta(mint: str) -> dict | None:
     """Pull lightweight metadata for a mint from the pump.fun API."""
@@ -66,13 +85,34 @@ def _extract_mint(tx: dict) -> str | None:
         return None
 
 
-async def ws_listen(on_token, reconnect_delay: float = 3.0):
+async def ws_listen(on_token, reconnect_delay: float = 3.0, seen: set = None):
     """
     Subscribe to pump.fun program logs via Helius WebSocket.
     on_token(meta_dict) is called for each discovered new token.
+
+    Dedup: the logsSubscribe stream fires for EVERY transaction mentioning the
+    pump.fun program (buys/sells too, not just token creation), and
+    _extract_mint() resolves many of those to the same already-seen mint. Without
+    a `seen` guard the same token is re-emitted dozens of times, spamming the
+    dashboard feed and burning one getTransaction RPC call each time. We dedup on
+    two levels:
+      * signature - skip a tx we already handled (cheapest, before any RPC call)
+      * mint      - skip a token already forwarded downstream
+    Both sets are bounded so a long-running process cannot leak memory.
     """
     import json
     import websockets
+
+    if seen is None:
+        seen = set()
+    seen_sigs = set()
+
+    # Adaptive "create" filter. We only want token-creation transactions, but if
+    # Helius/pump.fun ever change their log wording the filter would silently
+    # starve discovery. So we watch it: after CREATE_PROBE_N consecutive misses
+    # we assume the wording changed and fall back to mint-level dedup alone.
+    create_filter = True
+    probed = 0
 
     ws_url = cfg.HELIUS_RPC_URL.replace("https://", "wss://").replace("http://", "ws://")
     subscribe = {
@@ -86,7 +126,9 @@ async def ws_listen(on_token, reconnect_delay: float = 3.0):
         try:
             async with websockets.connect(ws_url) as ws:
                 await ws.send(json.dumps(subscribe))
-                print(f"[ws] subscribed to pump.fun logs ({ws_url})")
+                # Never log the raw URL: it carries the Helius API key as a query
+                # param and stdout is captured into dashboard.log.
+                print(f"[ws] subscribed to pump.fun logs ({_redact(ws_url)})")
                 async for raw in ws:
                     msg = json.loads(raw)
                     if msg.get("method") != "logsNotification":
@@ -94,12 +136,29 @@ async def ws_listen(on_token, reconnect_delay: float = 3.0):
                     params = msg["params"]["result"]
                     logs = params.get("value", {})
                     sig = logs.get("signature")
-                    if not sig:
+                    if not sig or sig in seen_sigs:
                         continue
+                    _remember(seen_sigs, sig, MAX_SEEN_SIGS)
+                    # Only "create" transactions mint a new token. Filtering on the
+                    # log text avoids an RPC round-trip for ordinary trades.
+                    log_lines = logs.get("logs") or []
+                    if create_filter and log_lines:
+                        if any("Instruction: Create" in ln for ln in log_lines):
+                            probed = 0
+                        else:
+                            probed += 1
+                            if probed >= CREATE_PROBE_N:
+                                create_filter = False
+                                print("[ws] 'Instruction: Create' never matched in "
+                                      f"{CREATE_PROBE_N} notifications - disabling "
+                                      "create-filter (log format may have changed); "
+                                      "falling back to mint-level dedup only")
+                            continue
                     tx = await _get_transaction(sig)
                     mint = _extract_mint(tx)
-                    if not mint:
+                    if not mint or mint in seen:
                         continue
+                    _remember(seen, mint, MAX_SEEN_MINTS)
                     meta = await _fetch_token_meta(mint)
                     if meta:
                         await on_token(meta)

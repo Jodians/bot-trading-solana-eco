@@ -16,3 +16,7 @@ solana-bot.log
 _test_*.py
 _dbg.py
 _syntaxcheck.py
+
+# Local backups / pre-restart snapshots
+*.bak-*
+*.pre-restart-*

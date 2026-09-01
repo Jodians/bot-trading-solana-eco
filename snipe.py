@@ -34,6 +34,12 @@ _monitors = set()
 async def handle_new_token(meta: dict):
     mint = meta.get("mint")
     name = meta.get("name", "?")
+
+    # Already holding this mint -> nothing to decide. Guard before any telemetry
+    # so a re-delivered token cannot inflate the scanned counter or the feed.
+    if mint in positions:
+        return
+
     print(f"[{datetime.now():%H:%M:%S}] new token: {name} ({mint})")
     await tel.emit({"type": "token_new", "mint": mint, "name": name,
                     "symbol": meta.get("symbol", ""), "mcap": meta.get("usd_market_cap", 0)})
@@ -44,8 +50,16 @@ async def handle_new_token(meta: dict):
         await tel.emit({"type": "token_eval", "mint": mint, "name": name,
                         "passed": False, "reason": reason})
         return
-    await tel.emit({"type": "token_eval", "mint": mint, "name": name,
-                    "passed": True, "reason": reason})
+
+    # Capacity check BEFORE the LLM gate: if we cannot open a position anyway,
+    # there is no point paying for an LLM call. Emitting the skip here also
+    # keeps the KPI arithmetic honest (exactly one verdict per token, so
+    # passed + skipped == scanned).
+    if len(positions) >= cfg.MAX_OPEN_POSITIONS:
+        print("    -> SKIP (max positions reached)")
+        await tel.emit({"type": "token_eval", "mint": mint, "name": name,
+                        "passed": False, "reason": "max positions reached"})
+        return
 
     # Optional LLM quality gate (Conduit). Fail-safe: error => PASS (no buy).
     if cfg.LLM_ANALYSIS_ENABLED:
@@ -63,11 +77,8 @@ async def handle_new_token(meta: dict):
                 notify(f"🚫 <b>SKIP (LLM)</b> {name}\n{verdict['reason']}")
             return
 
-    if len(positions) >= cfg.MAX_OPEN_POSITIONS:
-        print("    -> SKIP (max positions reached)")
-        await tel.emit({"type": "token_eval", "mint": mint, "name": name,
-                        "passed": False, "reason": "max positions reached"})
-        return
+    await tel.emit({"type": "token_eval", "mint": mint, "name": name,
+                    "passed": True, "reason": reason})
 
     print(f"    -> PASS ({reason}) -> attempting buy (paper={not cfg.LIVE_TRADING})")
     result = await buy_token(mint, cfg.BUY_AMOUNT_SOL)
