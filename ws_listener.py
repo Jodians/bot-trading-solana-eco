@@ -1,23 +1,36 @@
 """
-ws_listener.py - Faster token discovery via Helius WebSocket (logsSubscribe).
+ws_listener.py - Token discovery via Helius WebSocket (logsSubscribe).
 
 Instead of polling pump.fun every 2s, we subscribe to logs mentioning the
-pump.fun program. Each new token launch emits a "create" transaction; we grab
-the signature, fetch the full transaction, and pull the new mint address from
-its account keys. Metadata (name/symbol/socials/mcap) is then fetched the same
-way the poller would, so the rest of the pipeline is unchanged.
+pump.fun program and decode the Anchor `CreateEvent` straight out of the
+`Program data:` log line (see pumpfun_events.py). The event carries the new
+mint, name, symbol and metadata URI, so discovery needs NO extra RPC call and
+no guessing.
 
-Why signature->getTransaction instead of raw instruction decoding: it avoids
-brittle manual decoding of pump.fun's binary layout and is robust to changes.
-Cost: one extra RPC call per new token (fine; new tokens are not that frequent).
+History / why this shape
+------------------------
+The first version did logsSubscribe -> getTransaction(sig) -> heuristically
+pick the new mint out of the account keys. That was one RPC round-trip per
+notification and the heuristic ("scan preTokenBalances, else take the last
+account key") silently resolved ordinary trades to already-seen mints, which is
+what spammed the dashboard feed.
+
+A text prefilter on "Instruction: Create" did not help either: pump.fun trades
+routinely contain `Instruction: CreateTokenAccount` from OTHER programs, so the
+substring matched non-creations, while genuine creations were not reliably
+distinguishable from the log text alone. The event discriminator is exact.
+
+getTransaction is kept ONLY as a fallback for the rare frame that looks like a
+creation but fails to decode (program upgrade, truncated logs).
 
 This module is NETWORK-ONLY (WebSocket + RPC). Paper mode is unaffected; it
 only discovers tokens faster.
 """
 import asyncio
-import base64
 import httpx
+
 from config import cfg
+from pumpfun_events import extract_new_mint, has_unknown_event
 
 # pump.fun program id (constant on mainnet)
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -25,8 +38,9 @@ PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 # Dedup budgets for ws_listen (bounded so a long run cannot leak memory).
 MAX_SEEN_MINTS = 5_000
 MAX_SEEN_SIGS = 20_000
-# Consecutive create-filter misses tolerated before assuming the log format changed.
-CREATE_PROBE_N = 400
+# If this many notifications decode zero CreateEvents, the program's event layout
+# probably changed -> warn once so discovery cannot starve silently.
+CREATE_WARN_AFTER = 5_000
 
 
 def _redact(url: str) -> str:
@@ -60,26 +74,19 @@ async def _get_transaction(signature: str) -> dict | None:
 
 
 def _extract_mint(tx: dict) -> str | None:
-    """New token mint is typically the first newly-created token account in the
-    create instruction's account list. Heuristic: the mint is an account that
-    did not exist before and is owned by the Token Program."""
+    """Fallback mint extraction from a fetched transaction.
+
+    Only used when a frame carries pump.fun event data that we could not decode.
+    Heuristic by nature - prefer the decoded CreateEvent whenever available.
+    """
     if not tx:
         return None
     try:
-        msg = tx["transaction"]["message"]
-        keys = msg.get("accountKeys", [])
-        # accountKeys is a list of strings (json encoding) or [{pubkey,...}]
+        keys = tx["transaction"]["message"].get("accountKeys", [])
         pubkeys = [k if isinstance(k, str) else k.get("pubkey") for k in keys]
-        # The mint is usually near the end of the create instruction's accounts.
-        # Safer: scan for an account owned by Token Program (Tokenkeg...) that is
-        # newly created. Helius marks accountIndex in meta.preTokenBalances.
-        meta = tx.get("meta", {})
-        ptb = meta.get("preTokenBalances", [])
-        for tb in ptb:
-            # mint with 0 pre-balance and owner = a non-program => likely new mint
+        for tb in tx.get("meta", {}).get("preTokenBalances", []):
             if tb.get("uiTokenAmount", {}).get("uiAmount", 0) == 0:
                 return tb.get("mint")
-        # Fallback: last account key (common for pump create)
         return pubkeys[-1] if pubkeys else None
     except Exception:
         return None
@@ -88,17 +95,11 @@ def _extract_mint(tx: dict) -> str | None:
 async def ws_listen(on_token, reconnect_delay: float = 3.0, seen: set = None):
     """
     Subscribe to pump.fun program logs via Helius WebSocket.
-    on_token(meta_dict) is called for each discovered new token.
+    on_token(meta_dict) is called once per newly created token.
 
-    Dedup: the logsSubscribe stream fires for EVERY transaction mentioning the
-    pump.fun program (buys/sells too, not just token creation), and
-    _extract_mint() resolves many of those to the same already-seen mint. Without
-    a `seen` guard the same token is re-emitted dozens of times, spamming the
-    dashboard feed and burning one getTransaction RPC call each time. We dedup on
-    two levels:
-      * signature - skip a tx we already handled (cheapest, before any RPC call)
+    Dedup is two-level, both sets bounded:
+      * signature - skip a frame we already handled (before any work)
       * mint      - skip a token already forwarded downstream
-    Both sets are bounded so a long-running process cannot leak memory.
     """
     import json
     import websockets
@@ -106,13 +107,8 @@ async def ws_listen(on_token, reconnect_delay: float = 3.0, seen: set = None):
     if seen is None:
         seen = set()
     seen_sigs = set()
-
-    # Adaptive "create" filter. We only want token-creation transactions, but if
-    # Helius/pump.fun ever change their log wording the filter would silently
-    # starve discovery. So we watch it: after CREATE_PROBE_N consecutive misses
-    # we assume the wording changed and fall back to mint-level dedup alone.
-    create_filter = True
-    probed = 0
+    frames = creates = 0
+    warned = False
 
     ws_url = cfg.HELIUS_RPC_URL.replace("https://", "wss://").replace("http://", "ws://")
     subscribe = {
@@ -133,34 +129,49 @@ async def ws_listen(on_token, reconnect_delay: float = 3.0, seen: set = None):
                     msg = json.loads(raw)
                     if msg.get("method") != "logsNotification":
                         continue
-                    params = msg["params"]["result"]
-                    logs = params.get("value", {})
-                    sig = logs.get("signature")
+                    value = msg["params"]["result"].get("value", {})
+                    sig = value.get("signature")
                     if not sig or sig in seen_sigs:
                         continue
                     _remember(seen_sigs, sig, MAX_SEEN_SIGS)
-                    # Only "create" transactions mint a new token. Filtering on the
-                    # log text avoids an RPC round-trip for ordinary trades.
-                    log_lines = logs.get("logs") or []
-                    if create_filter and log_lines:
-                        if any("Instruction: Create" in ln for ln in log_lines):
-                            probed = 0
-                        else:
-                            probed += 1
-                            if probed >= CREATE_PROBE_N:
-                                create_filter = False
-                                print("[ws] 'Instruction: Create' never matched in "
-                                      f"{CREATE_PROBE_N} notifications - disabling "
-                                      "create-filter (log format may have changed); "
-                                      "falling back to mint-level dedup only")
-                            continue
-                    tx = await _get_transaction(sig)
-                    mint = _extract_mint(tx)
+                    if value.get("err"):  # failed tx never created anything
+                        continue
+
+                    logs = value.get("logs") or []
+                    frames += 1
+                    event = extract_new_mint(logs)
+
+                    if event:
+                        creates += 1
+                        mint = event["mint"]
+                    elif has_unknown_event(logs):
+                        # An event tag we do not recognise: the program was likely
+                        # upgraded. Pay for one RPC call rather than miss a launch.
+                        # Recognised non-create events (trades, completions) fall
+                        # through to `continue` and cost nothing.
+                        mint = _extract_mint(await _get_transaction(sig))
+                    else:
+                        continue
+
                     if not mint or mint in seen:
                         continue
                     _remember(seen, mint, MAX_SEEN_MINTS)
+
+                    if not warned and not creates and frames >= CREATE_WARN_AFTER:
+                        warned = True
+                        print(f"[ws] WARNING: {frames} notifications, zero CreateEvents "
+                              "decoded - pump.fun's event layout may have changed "
+                              "(see pumpfun_events.CREATE_EVENT)")
+
                     meta = await _fetch_token_meta(mint)
                     if meta:
+                        # Trust the on-chain event for identity; the API/DexScreener
+                        # fallback is often missing name/symbol for fresh mints.
+                        if event:
+                            meta.setdefault("mint", mint)
+                            for k in ("name", "symbol"):
+                                if event.get(k) and not meta.get(k):
+                                    meta[k] = event[k]
                         await on_token(meta)
         except Exception as e:
             print(f"[ws] error: {e}; reconnecting in {reconnect_delay}s")

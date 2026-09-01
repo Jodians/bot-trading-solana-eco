@@ -1,16 +1,19 @@
 """
-test_dashboard_fixes.py - Verifies the three dashboard/telemetry fixes:
+test_dashboard_fixes.py - Verifies the dashboard/telemetry/discovery fixes:
 
-  1. ws_listener dedup: the same mint / signature is only forwarded once, and
-     non-create transactions never trigger a getTransaction RPC call.
-  2. KPI invariant: passed + skipped == scanned (exactly one token_eval verdict
+  1. ws_listener discovery: the pump.fun CreateEvent is decoded straight from the
+     `Program data:` log line -> zero getTransaction calls; trades and failed txs
+     are never mistaken for launches; each mint/signature is handled once.
+  1b. an undecodable pump.fun event still falls back to getTransaction.
+  2-4. KPI invariant: passed + skipped == scanned (exactly one token_eval verdict
      per token_new), including the max-positions and LLM-reject paths.
-  3. Re-delivered tokens already held as positions emit no telemetry at all.
+  5. Re-delivered tokens already held as positions emit no telemetry at all.
 
 Pure unit tests - no network, no RPC, no real trades. Run:
     .venv/Scripts/python.exe test_dashboard_fixes.py
 """
 import asyncio
+import os
 import sys
 
 import config
@@ -98,47 +101,78 @@ class _StopFeed(BaseException):
     Exception` reconnect handler does not swallow it into an endless retry."""
 
 
-def notification(sig, logs):
+def notification(sig, logs, err=None):
     import json
     return json.dumps({
         "method": "logsNotification",
-        "params": {"result": {"value": {"signature": sig, "logs": logs}}},
+        "params": {"result": {"value": {"signature": sig, "logs": logs, "err": err}}},
     })
 
 
+def create_logs(mint_raw, name="Tok", symbol="TK"):
+    """Build a realistic pump.fun CreateEvent log frame for `mint_raw` (32 bytes)."""
+    import base64, struct
+    import pumpfun_events as E
+
+    def bstr(s):
+        b = s.encode()
+        return struct.pack("<I", len(b)) + b
+
+    payload = (E.CREATE_EVENT + bstr(name) + bstr(symbol) + bstr("ipfs://x")
+               + mint_raw + os.urandom(32) + os.urandom(32) + b"\x00" * 40)
+    return [
+        f"Program {ws_listener.PUMP_PROGRAM} invoke [1]",
+        "Program log: Instruction: Create",
+        "Program data: " + base64.b64encode(payload).decode(),
+        f"Program {ws_listener.PUMP_PROGRAM} success",
+    ]
+
+
+def trade_logs():
+    """A pump.fun TRADE: carries a TradeEvent blob and a decoy CreateTokenAccount."""
+    import base64
+    import pumpfun_events as E
+    payload = E.TRADE_EVENT + os.urandom(96)
+    return [
+        "Program log: Instruction: CreateTokenAccount",   # decoy for text filters
+        f"Program {ws_listener.PUMP_PROGRAM} invoke [2]",
+        "Program log: Instruction: Sell",
+        "Program data: " + base64.b64encode(payload).decode(),
+    ]
+
+
 async def test_ws_dedup():
-    print("test 1: ws_listener dedup + create-filter")
-    CREATE = ["Program log: Instruction: Create"]
-    TRADE = ["Program log: Instruction: Buy"]
+    print("test 1: ws_listener CreateEvent decode + dedup (zero RPC)")
+    import pumpfun_events as E
+
+    raw_a, raw_b = os.urandom(32), os.urandom(32)
+    MINT_A, MINT_B = E.b58encode(raw_a), E.b58encode(raw_b)
+
     msgs = [
-        notification("sig1", CREATE),   # new mint  -> forwarded
-        notification("sig1", CREATE),   # same sig  -> dropped (no RPC)
-        notification("sig2", CREATE),   # new sig, same mint -> dropped at mint level
-        notification("sig3", TRADE),    # a plain trade -> dropped, no RPC
-        notification("sig4", CREATE),   # new mint  -> forwarded
+        notification("sig1", create_logs(raw_a, "Alpha", "ALP")),  # new -> forwarded
+        notification("sig1", create_logs(raw_a)),                  # dup sig -> dropped
+        notification("sig2", create_logs(raw_a)),                  # dup mint -> dropped
+        notification("sig3", trade_logs()),                        # trade -> dropped
+        notification("sig4", create_logs(raw_b, "Beta", "BET")),   # new -> forwarded
+        notification("sig5", create_logs(os.urandom(32)), err={"InstructionError": 1}),
     ]
 
     rpc_calls = []
-    sig_to_mint = {"sig1": "MINT_A", "sig2": "MINT_A", "sig4": "MINT_B"}
 
     async def fake_get_tx(sig):
         rpc_calls.append(sig)
-        return {"_sig": sig}
-
-    def fake_extract(tx):
-        return sig_to_mint.get(tx["_sig"]) if tx else None
+        return {}
 
     async def fake_meta(mint):
-        return meta(mint)
+        return {"mint": mint, "usd_market_cap": 5000}  # no name/symbol, like DexScreener
 
     ws_listener._get_transaction = fake_get_tx
-    ws_listener._extract_mint = fake_extract
     ws_listener._fetch_token_meta = fake_meta
 
     forwarded = []
 
     async def on_token(m):
-        forwarded.append(m["mint"])
+        forwarded.append(m)
 
     fake = FakeWS(msgs)
     fake_mod = type(sys)("websockets")
@@ -151,14 +185,53 @@ async def test_ws_dedup():
     finally:
         sys.modules.pop("websockets", None)
 
-    check("each mint forwarded exactly once", forwarded == ["MINT_A", "MINT_B"],
-          f"got {forwarded}")
-    check("duplicate signature makes no RPC call", rpc_calls.count("sig1") == 1,
-          f"rpc_calls={rpc_calls}")
-    check("non-create tx makes no RPC call", "sig3" not in rpc_calls,
-          f"rpc_calls={rpc_calls}")
-    check("RPC calls == unique create sigs (3)", len(rpc_calls) == 3,
-          f"rpc_calls={rpc_calls}")
+    mints = [m["mint"] for m in forwarded]
+    check("each mint forwarded exactly once", mints == [MINT_A, MINT_B], f"got {mints}")
+    check("ZERO getTransaction calls (decode only)", rpc_calls == [], f"rpc={rpc_calls}")
+    check("trade tx not treated as a launch", MINT_A in mints and len(mints) == 2)
+    check("failed tx skipped", len(mints) == 2, f"got {mints}")
+    check("event name/symbol fill gaps in meta",
+          forwarded and forwarded[0].get("symbol") == "ALP", forwarded[:1])
+
+
+async def test_ws_fallback_rpc():
+    print("test 1b: undecodable pump.fun event falls back to getTransaction")
+    import pumpfun_events as E
+    import base64
+    raw = os.urandom(32)
+    MINT = E.b58encode(raw)
+
+    # a pump.fun event blob with an unknown discriminator -> cannot decode,
+    # but iter_program_data() sees it, so we must pay for one RPC call.
+    weird = ["Program data: " + base64.b64encode(os.urandom(8) + os.urandom(60)).decode()]
+
+    rpc_calls = []
+
+    async def fake_get_tx(sig):
+        rpc_calls.append(sig)
+        return {"transaction": {"message": {"accountKeys": [MINT]}}, "meta": {}}
+
+    async def fake_meta(mint):
+        return {"mint": mint}
+
+    ws_listener._get_transaction = fake_get_tx
+    ws_listener._fetch_token_meta = fake_meta
+
+    got = []
+    fake = FakeWS([notification("sigX", weird)])
+    fake_mod = type(sys)("websockets")
+    fake_mod.connect = lambda url: fake
+    sys.modules["websockets"] = fake_mod
+    try:
+        await asyncio.wait_for(ws_listener.ws_listen(got.append, reconnect_delay=0.01), 5)
+    except (asyncio.TimeoutError, _StopFeed):
+        pass
+    finally:
+        sys.modules.pop("websockets", None)
+
+    check("fallback made exactly one RPC call", rpc_calls == ["sigX"], rpc_calls)
+    check("fallback still yields the mint",
+          [m["mint"] for m in got] == [MINT], got)
 
 
 # ---------------------------------------------------------------- test 2
@@ -233,6 +306,7 @@ async def test_held_position_not_rescanned():
 
 async def main():
     await test_ws_dedup()
+    await test_ws_fallback_rpc()
     await test_kpi_invariant_max_positions()
     await test_kpi_invariant_filter_reject()
     await test_kpi_invariant_llm_reject()
