@@ -14,6 +14,9 @@ test_dashboard_fixes.py - Verifies the dashboard/telemetry/discovery fixes:
      position, no fake P&L) when the token has no route yet.
   7. Position monitoring marks to market with real sell quotes, tolerates a
      transient quote failure, and abandons a position that stays unpriceable.
+  8. Live-safety gates: positions survive a restart, a flatlining position ages
+     out, a live buy is refused unless the wallet is verifiably funded, and an
+     unconfirmed live swap is never booked as a fill.
 
 Pure unit tests - no network, no RPC, no real trades. Run:
     .venv/Scripts/python.exe test_dashboard_fixes.py
@@ -21,6 +24,7 @@ Pure unit tests - no network, no RPC, no real trades. Run:
 import asyncio
 import os
 import sys
+import tempfile
 
 import config
 
@@ -30,6 +34,15 @@ cfg.LIVE_TRADING = False
 cfg.MAX_OPEN_POSITIONS = 2
 cfg.BUY_AMOUNT_SOL = 0.1
 cfg.LLM_ANALYSIS_ENABLED = False
+cfg.MAX_HOLD_SEC = 0
+cfg.MIN_SOL_RESERVE = 0.02
+
+import positions_store
+
+# Never touch the real positions.json: these tests would otherwise clobber the
+# live bot's persisted holdings on the same machine.
+positions_store.PATH = os.path.join(tempfile.gettempdir(),
+                                    "hermes-test-positions.json")
 
 import snipe
 import ws_listener
@@ -651,6 +664,336 @@ async def test_monitor_abandons_unpriceable_position():
           not cap.of_type("position_tick"), cap.of_type("position_tick")[:2])
 
 
+# ------------------------------------------------- test 8: live-safety gates
+# These cover the four gaps that made LIVE trading unsafe. Every network call is
+# stubbed; cfg.LIVE_TRADING is forced True only inside the stubbed live tests and
+# always restored, so nothing here can reach the chain.
+
+def _clear_store():
+    """Remove the temp positions file so each test starts from a known state."""
+    if os.path.exists(positions_store.PATH):
+        os.unlink(positions_store.PATH)
+
+
+async def test_positions_survive_restart():
+    """A restart must not orphan a real holding: the position is persisted on
+    entry and reload puts it back with enough detail to sell it."""
+    print("test 8: an open position survives a restart")
+    reset_bot((True, "ok"))
+    _clear_store()
+    await snipe.handle_new_token(meta("SURVIVE", "Survivor"))
+    check("position opened", "SURVIVE" in snipe.positions, snipe.positions)
+    check("persisted to disk", os.path.exists(positions_store.PATH))
+
+    # Simulate the process dying and coming back up.
+    snipe.positions.clear()
+    snipe._monitors.clear()
+    restored = snipe.restore_positions()
+
+    check("position restored", "SURVIVE" in restored, restored)
+    p = snipe.positions.get("SURVIVE", {})
+    check("sellable amount preserved", p.get("token_amount") == 1000, p)
+    check("cost basis preserved", p.get("buy_sol") == cfg.BUY_AMOUNT_SOL, p)
+    check("name preserved for alerts", p.get("meta", {}).get("name") == "Survivor", p)
+    check("flagged restored so the monitor skips SELL_DELAY",
+          p.get("restored") is True, p)
+    _clear_store()
+
+
+async def test_persisted_junk_is_not_restored():
+    """Rows that cannot be sold, and a corrupt file, must not resurrect as
+    phantom positions the monitor would spin on forever."""
+    print("test 8b: unsellable rows and a corrupt file are ignored")
+    reset_bot((True, "ok"))
+    import json
+    with open(positions_store.PATH, "w", encoding="utf-8") as f:
+        json.dump({
+            "Good": {"bought_at": 1.0, "buy_sol": 0.1, "token_amount": 10, "paper": True},
+            "ZeroTok": {"bought_at": 1.0, "buy_sol": 0.1, "token_amount": 0, "paper": True},
+            "ZeroSol": {"bought_at": 1.0, "buy_sol": 0, "token_amount": 10, "paper": True},
+            "Junk": "not-a-dict",
+        }, f)
+    loaded = positions_store.load()
+    check("sellable row kept", "Good" in loaded, loaded)
+    check("zero-token row dropped", "ZeroTok" not in loaded, loaded)
+    check("zero-cost row dropped", "ZeroSol" not in loaded, loaded)
+    check("non-dict row dropped", "Junk" not in loaded, loaded)
+
+    with open(positions_store.PATH, "w", encoding="utf-8") as f:
+        f.write("{ not json at all")
+    check("corrupt file yields empty instead of crashing the bot",
+          positions_store.load() == {})
+    _clear_store()
+    check("missing file yields empty", positions_store.load() == {})
+
+
+async def test_restore_does_not_clobber_live_position():
+    """A stale file must never overwrite what the running process already holds."""
+    print("test 8c: restore never overwrites a live position")
+    reset_bot((True, "ok"))
+    import json
+    snipe.positions["Held"] = {"bought_at": 5.0, "buy_sol": 0.1,
+                               "token_amount": 999, "paper": True,
+                               "meta": {"name": "Live"}}
+    with open(positions_store.PATH, "w", encoding="utf-8") as f:
+        json.dump({"Held": {"bought_at": 1.0, "buy_sol": 0.1, "token_amount": 1,
+                            "paper": True, "name": "Stale"}}, f)
+    snipe.restore_positions()
+    check("in-memory position wins over the file",
+          snipe.positions["Held"]["token_amount"] == 999, snipe.positions["Held"])
+    _clear_store()
+
+
+async def test_max_hold_exit_decision():
+    """A position that flatlines between TP and SL must age out. Observed in a
+    real run: two positions pinned at 0.97x for 45 minutes while 241 later
+    candidates were rejected for "max positions reached"."""
+    print("test 8d: MAX_HOLD_SEC ages out a flatlining position")
+    cfg.MAX_HOLD_SEC = 900
+    check("flat 0.97x, young -> hold", snipe.decide_exit(0.97, 100) == "")
+    check("flat 0.97x, aged -> TIMEOUT", snipe.decide_exit(0.97, 901) == "TIMEOUT",
+          snipe.decide_exit(0.97, 901))
+    check("aged exactly at the cap -> TIMEOUT", snipe.decide_exit(0.97, 900) == "TIMEOUT")
+    check("TP still wins on an aged position", snipe.decide_exit(2.5, 9999) == "TP")
+    check("SL still wins on an aged position", snipe.decide_exit(0.4, 9999) == "SL")
+    cfg.MAX_HOLD_SEC = 0
+    check("a cap of 0 disables the timeout", snipe.decide_exit(0.97, 999999) == "")
+
+
+async def test_monitor_sells_aged_position():
+    """The decision is only half of it - the monitor must actually sell."""
+    print("test 8e: the monitor sells a position that ages out")
+    reset_bot((True, "ok"))
+    _clear_store()
+    import time as _t
+    cfg.MAX_HOLD_SEC = 1
+    cfg.SELL_DELAY_SEC = 0
+    cfg.PRICE_CHECK_SEC = 0.01
+    # bought 10s ago and flat at 0.97x: between TP and SL, so only the clock exits
+    snipe.positions["Flat"] = {"bought_at": _t.time() - 10, "buy_sol": 0.1,
+                               "token_amount": 100, "paper": True,
+                               "meta": {"name": "Flatline"}, "restored": True}
+    sells = []
+
+    async def quote(_m, _a):
+        return 0.097  # 0.97x on a 0.1 SOL entry
+
+    async def sell(m, a):
+        sells.append((m, a))
+        return {"paper": True, "action": "SELL"}
+
+    snipe.get_sell_quote = quote
+    snipe.sell_token = sell
+    with CaptureWS() as cap:
+        await asyncio.wait_for(_REAL_MONITOR("Flat"), 5)
+
+    check("aged position was sold with the held amount", sells == [("Flat", 100)], sells)
+    check("position closed", "Flat" not in snipe.positions)
+    check("booked by realized outcome, not its own bucket (0.97x -> loss)",
+          tel.stats["exits_sl"] == 1 and tel.stats["exits_tp"] == 0,
+          f"sl={tel.stats['exits_sl']} tp={tel.stats['exits_tp']}")
+    rows = cap.of_type("exit_sl")
+    check("exit carries a 'max hold' reason",
+          len(rows) == 1 and rows[0].get("reason") == "max hold", rows)
+    check("close is persisted so a restart does not resurrect it",
+          positions_store.load() == {}, positions_store.load())
+    cfg.MAX_HOLD_SEC = 0
+
+
+async def test_live_buy_requires_funded_wallet():
+    """Spending against an unverified balance is how a bot buys something it
+    cannot afford to exit. Unknown balance must count as unfunded."""
+    print("test 8f: live buys require a verifiably funded wallet")
+    reset_bot((True, "ok"))
+    cfg.LIVE_TRADING = False
+    ok, note = await snipe._has_funds_for_buy()
+    check("paper mode never needs a balance", ok and note == "paper", note)
+
+    cfg.LIVE_TRADING = True
+    try:
+        async def rich():
+            return 5.0
+        snipe.get_balance_sol = rich
+        ok, note = await snipe._has_funds_for_buy()
+        check("funded wallet may buy", ok, note)
+
+        async def thin():
+            return 0.11  # needs 0.1 buy + 0.02 reserve = 0.12
+        snipe.get_balance_sol = thin
+        ok, note = await snipe._has_funds_for_buy()
+        check("reserve is enforced, not just the buy size", not ok, note)
+        check("refusal quantifies the shortfall", "insufficient SOL" in note, note)
+
+        async def unknown():
+            return None
+        snipe.get_balance_sol = unknown
+        ok, note = await snipe._has_funds_for_buy()
+        check("unknown balance counts as unfunded", not ok, note)
+        check("refusal names the cause", "unknown" in note.lower(), note)
+    finally:
+        cfg.LIVE_TRADING = False
+
+
+async def test_unfunded_wallet_opens_no_position():
+    """The gate has to sit in the intake path, not just exist as a helper."""
+    print("test 8g: an unfunded wallet opens no position")
+    reset_bot((True, "ok"))
+    cfg.LIVE_TRADING = True
+    try:
+        async def broke():
+            return 0.0
+        bought = []
+
+        async def buy(m, _s):
+            bought.append(m)
+            return {"paper": False, "token_amount": 1}
+
+        snipe.get_balance_sol = broke
+        snipe.buy_token = buy
+        await snipe.handle_new_token(meta("POOR", "Poor"))
+        check("no buy attempted", bought == [], bought)
+        check("no position opened", "POOR" not in snipe.positions, snipe.positions)
+        check("counted as skipped, keeping passed+skipped==scanned",
+              tel.stats["skipped"] == 1 and tel.stats["passed"] == 0,
+              f"skipped={tel.stats['skipped']} passed={tel.stats['passed']}")
+    finally:
+        cfg.LIVE_TRADING = False
+
+
+async def test_quote_stays_read_only():
+    """Ultra only builds a transaction when the request names a taker. Quotes
+    must stay taker-less (no wallet needed, nothing signable); only swaps pass
+    one - otherwise the live path dies on a missing `transaction`."""
+    print("test 8h: quotes send no taker, swaps do")
+    import jupiter
+    seen = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"outAmount": "123"}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, _url, params=None):
+            seen.update(params or {})
+            return FakeResp()
+
+    orig = jupiter.httpx.AsyncClient
+    jupiter.httpx.AsyncClient = lambda **kw: FakeClient()
+    try:
+        await jupiter._order("A", "B", 1)
+        check("no taker on a plain quote", "taker" not in seen, seen)
+
+        seen.clear()
+        cfg.PRIORITY_FEE_LAMPORTS = 7777
+        await jupiter._order("A", "B", 1, taker="WALLET")
+        check("taker sent when swapping", seen.get("taker") == "WALLET", seen)
+        check("priority fee forwarded when configured",
+              seen.get("priorityFeeLamports") == "7777", seen)
+
+        seen.clear()
+        cfg.PRIORITY_FEE_LAMPORTS = 0
+        await jupiter._order("A", "B", 1, taker="WALLET")
+        check("priority fee omitted when 0 (Jupiter prices it)",
+              "priorityFeeLamports" not in seen, seen)
+    finally:
+        jupiter.httpx.AsyncClient = orig
+
+
+async def test_unconfirmed_swap_is_not_a_fill():
+    """A submitted tx is not a landed tx. Booking one as a fill leaves the bot
+    tracking tokens it may not own."""
+    print("test 8i: an unconfirmed live swap is never booked as a fill")
+    import jupiter
+    cfg.LIVE_TRADING = True
+    o_sub, o_ord, o_kp = jupiter._submit, jupiter._order, jupiter.load_keypair
+    try:
+        jupiter.load_keypair = lambda: type("K", (), {"pubkey": lambda s: "PK"})()
+
+        async def order(*_a, **_kw):
+            return {"requestId": "r", "transaction": "t", "outAmount": "500000000"}
+
+        async def unconfirmed(_o):
+            return {"confirmed": False, "signature": "SIG",
+                    "status": "not confirmed within 45s (last: pending)"}
+
+        jupiter._order = order
+        jupiter._submit = unconfirmed
+
+        buy = await jupiter.buy_token("M", 0.1)
+        check("unconfirmed buy yields no tokens", buy.get("token_amount") == 0, buy)
+        check("unconfirmed buy is flagged so no position opens",
+              buy.get("quote_failed") is True, buy)
+        check("signature kept for manual inspection", buy.get("signature") == "SIG", buy)
+
+        sell = await jupiter.sell_token("M", 100)
+        check("unconfirmed sell reports confirmed=False",
+              sell.get("confirmed") is False, sell)
+        check("unconfirmed sell claims no proceeds", "sol_out" not in sell, sell)
+
+        async def confirmed(_o):
+            return {"confirmed": True, "signature": "SIG2", "status": "confirmed"}
+
+        jupiter._submit = confirmed
+        ok = await jupiter.sell_token("M", 100)
+        check("confirmed sell books proceeds", ok.get("sol_out") == 0.5, ok)
+
+        # An order with no transaction (fetched without a taker) must be refused
+        # rather than raising KeyError on the live path.
+        jupiter._submit = o_sub
+        res = await jupiter._submit({"requestId": "x"})
+        check("order without a transaction is refused, not signed",
+              res.get("confirmed") is False
+              and "no transaction" in (res.get("error") or ""), res)
+    finally:
+        jupiter._submit, jupiter._order, jupiter.load_keypair = o_sub, o_ord, o_kp
+        cfg.LIVE_TRADING = False
+
+
+async def test_monitor_retries_unconfirmed_sell():
+    """An unconfirmed sell leaves the tokens in the wallet, so the position must
+    stay open and retry rather than book a fill that never happened."""
+    print("test 8j: an unconfirmed sell keeps the position open to retry")
+    reset_bot((True, "ok"))
+    _clear_store()
+    import time as _t
+    cfg.MAX_HOLD_SEC = 0
+    cfg.SELL_DELAY_SEC = 0
+    cfg.PRICE_CHECK_SEC = 0.01
+    snipe.positions["Stuck"] = {"bought_at": _t.time(), "buy_sol": 0.1,
+                                "token_amount": 100, "paper": True,
+                                "meta": {"name": "Stuck"}, "restored": True}
+    attempts = {"n": 0}
+
+    async def quote(_m, _a):
+        return 0.25  # 2.5x -> TP on every tick
+
+    async def sell(_m, _a):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return {"paper": False, "confirmed": False, "note": "tx dropped"}
+        return {"paper": False, "confirmed": True, "sol_out": 0.25}
+
+    snipe.get_sell_quote = quote
+    snipe.sell_token = sell
+    await asyncio.wait_for(_REAL_MONITOR("Stuck"), 5)
+
+    check("retried until confirmed", attempts["n"] == 3, attempts)
+    check("closed only on the confirmed sell", "Stuck" not in snipe.positions,
+          snipe.positions)
+    check("exactly one exit booked, not one per attempt",
+          tel.stats["exits_tp"] == 1, f"tp={tel.stats['exits_tp']}")
+    _clear_store()
+
+
 async def main():
     await test_ws_dedup()
     await test_ws_fallback_rpc()
@@ -665,6 +1008,16 @@ async def main():
     await test_monitor_marks_to_market()
     await test_monitor_tolerates_transient_quote_failure()
     await test_monitor_abandons_unpriceable_position()
+    await test_positions_survive_restart()
+    await test_persisted_junk_is_not_restored()
+    await test_restore_does_not_clobber_live_position()
+    await test_max_hold_exit_decision()
+    await test_monitor_sells_aged_position()
+    await test_live_buy_requires_funded_wallet()
+    await test_unfunded_wallet_opens_no_position()
+    await test_quote_stays_read_only()
+    await test_unconfirmed_swap_is_not_a_fill()
+    await test_monitor_retries_unconfirmed_sell()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")

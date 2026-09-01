@@ -12,6 +12,11 @@ venv/
 push.log
 solana-bot.log
 
+# Runtime state: open positions held by THIS machine's wallet. Machine-specific
+# and privacy-sensitive (reveals holdings) - never commit it.
+positions.json
+.positions-*.tmp
+
 # Test/debug scratch
 _test_*.py
 _dbg.py

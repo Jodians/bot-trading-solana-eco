@@ -99,6 +99,28 @@ class Config:
     # Healthy pump.fun tokens sit around 88-95%. 0 disables (2 quotes per token).
     MIN_ROUND_TRIP_PCT = float(os.getenv("MIN_ROUND_TRIP_PCT", "0"))
 
+    # --- Live-execution safety ----------------------------------------------
+    # Hard cap on how long a position may be held, in seconds. Without this the
+    # only exits are TP and SL, so a token that flatlines between them ties up
+    # capital forever: a 45-minute paper run showed two positions pinned at
+    # 0.97x with stdev 0.006 and 0.000 while 241 later candidates were rejected
+    # for "max positions reached". 0 disables (not recommended for live).
+    MAX_HOLD_SEC = int(os.getenv("MAX_HOLD_SEC", "0"))
+
+    # SOL that must remain in the wallet after a buy, covering signature fees,
+    # ATA rent and the eventual sell. Live buys are skipped when balance minus
+    # BUY_AMOUNT_SOL would fall below this.
+    MIN_SOL_RESERVE = float(os.getenv("MIN_SOL_RESERVE", "0.02"))
+
+    # Extra priority fee (micro-lamports per compute unit) handed to Jupiter as
+    # priorityFeeLamports. On pump.fun launches an unprioritised tx often never
+    # lands. 0 = let Jupiter pick (it quotes ~500 lamports on a quiet market).
+    PRIORITY_FEE_LAMPORTS = int(os.getenv("PRIORITY_FEE_LAMPORTS", "0"))
+
+    # Seconds to wait for a live swap signature to confirm on-chain. Submitting
+    # without confirming means the bot believes it holds tokens it may not.
+    CONFIRM_TIMEOUT_SEC = int(os.getenv("CONFIRM_TIMEOUT_SEC", "45"))
+
     @classmethod
     def validate(cls):
         errors = []

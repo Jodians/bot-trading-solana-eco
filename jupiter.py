@@ -8,8 +8,8 @@ Read-only quote helpers (get_buy_quote / get_sell_quote) hit the network but
 only ever ASK for a price - they are safe in any mode and are what paper mode
 uses to mark positions to market.
 
-Two bugs lived here and are worth remembering
---------------------------------------------
+Three bugs lived here and are worth remembering
+-----------------------------------------------
 1. `outAmount` is a TOP-LEVEL field of an Ultra /order response. The old code
    read `order["quote"]["outAmount"]`, a subobject Ultra does not return, so
    EVERY quote silently resolved to 0. Downstream that meant paper positions
@@ -18,7 +18,13 @@ Two bugs lived here and are worth remembering
 2. `sell_token` used to depend on a function-LOCAL `VersionedTransaction`
    import that only existed inside `buy_token`, so the first live sell raised
    NameError - buys worked, exits did not. The import is module-level now.
+3. Ultra only builds a transaction when the request names a `taker`. Without it
+   the response carries a price but NO `transaction` field, so the live path
+   died on KeyError at the first real swap. Quotes deliberately stay
+   taker-less (read-only, no wallet needed); only _order_for_swap() passes the
+   taker and therefore gets something signable.
 """
+import asyncio
 import base64
 
 import httpx
@@ -31,14 +37,26 @@ WSOL = "So11111111111111111111111111111111111111112"
 LAMPORTS = 1_000_000_000
 
 
-async def _order(input_mint: str, output_mint: str, amount: int) -> dict:
-    """Ask Ultra for an order (which doubles as a quote). Read-only."""
+async def _order(input_mint: str, output_mint: str, amount: int,
+                 taker: str | None = None) -> dict:
+    """
+    Ask Ultra for an order. Read-only unless `taker` is set.
+
+    With no taker this is purely a price lookup. With a taker Ultra also returns
+    an unsigned `transaction` plus `requestId`, which is what live swaps need.
+    """
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
         "amount": str(amount),
         "slippageBps": str(cfg.SLIPPAGE_BPS),
     }
+    if taker:
+        params["taker"] = taker
+        # Ultra prices its own priority fee; override only when configured, as
+        # an unprioritised tx frequently fails to land during a launch burst.
+        if cfg.PRIORITY_FEE_LAMPORTS > 0:
+            params["priorityFeeLamports"] = str(cfg.PRIORITY_FEE_LAMPORTS)
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(f"{cfg.JUPITER_ULTRA_URL}/order", params=params)
         r.raise_for_status()
@@ -91,18 +109,70 @@ async def get_sell_quote(mint: str, token_amount: int) -> float | None:
         return None
 
 
-async def _submit(order: dict) -> dict:
-    """Sign an Ultra order and execute it. LIVE ONLY - callers must gate."""
-    kp = load_keypair()
-    tx = VersionedTransaction.from_bytes(base64.b64decode(order["transaction"]))
-    signed = kp.sign_versioned_transaction(tx)
+async def _confirm(signature: str) -> tuple[bool, str]:
+    """
+    Poll getSignatureStatuses until the swap lands or CONFIRM_TIMEOUT_SEC passes.
+
+    Submitting and assuming success is how a bot ends up tracking a position it
+    does not own (tx dropped) or missing one it does. Returns (ok, detail); an
+    unconfirmed-but-not-failed tx returns ok=False so the caller does not record
+    a fill it cannot prove.
+    """
+    if not signature:
+        return False, "no signature returned"
+    deadline = asyncio.get_event_loop().time() + max(cfg.CONFIRM_TIMEOUT_SEC, 1)
+    last = "pending"
     async with httpx.AsyncClient(timeout=15) as client:
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                r = await client.post(cfg.HELIUS_RPC_URL, json={
+                    "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
+                    "params": [[signature], {"searchTransactionHistory": True}],
+                })
+                r.raise_for_status()
+                value = (r.json().get("result") or {}).get("value") or [None]
+                st = value[0]
+                if st:
+                    if st.get("err"):
+                        return False, f"tx failed on-chain: {st['err']}"
+                    status = st.get("confirmationStatus") or "processed"
+                    last = status
+                    if status in ("confirmed", "finalized"):
+                        return True, status
+            except Exception as e:
+                last = f"status check error: {e}"
+            await asyncio.sleep(2)
+    return False, f"not confirmed within {cfg.CONFIRM_TIMEOUT_SEC}s (last: {last})"
+
+
+async def _submit(order: dict) -> dict:
+    """
+    Sign an Ultra order, execute it, and wait for on-chain confirmation.
+
+    LIVE ONLY - callers must gate on cfg.LIVE_TRADING. The returned dict always
+    carries `confirmed` so the caller can tell a landed swap from a submitted
+    one, plus `signature` for manual inspection.
+    """
+    tx_b64 = order.get("transaction")
+    if not tx_b64:
+        # Happens when the order was fetched without a taker: price only.
+        return {"confirmed": False, "error": "order has no transaction to sign"}
+    kp = load_keypair()
+    tx = VersionedTransaction.from_bytes(base64.b64decode(tx_b64))
+    signed = kp.sign_versioned_transaction(tx)
+    async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             f"{cfg.JUPITER_ULTRA_URL}/order/{order['requestId']}/execute",
             json={"signedTransaction": base64.b64encode(bytes(signed)).decode()},
         )
         r.raise_for_status()
-        return r.json()
+        result = r.json()
+
+    signature = result.get("signature") or result.get("txid") or ""
+    ok, detail = await _confirm(signature)
+    print(f"[swap] signature={signature or '?'} confirmed={ok} ({detail})")
+    return {"confirmed": ok, "signature": signature, "status": detail,
+            "result": result}
 
 
 async def buy_token(mint: str, sol_amount: float) -> dict:
@@ -136,14 +206,28 @@ async def buy_token(mint: str, sol_amount: float) -> dict:
             "note": "DRY-RUN: no transaction sent; size from real Jupiter quote",
         }
 
-    order = await _order(WSOL, mint, int(sol_amount * LAMPORTS))
-    result = await _submit(order)
+    order = await _order(WSOL, mint, int(sol_amount * LAMPORTS),
+                         taker=load_keypair().pubkey().__str__())
+    res = await _submit(order)
+    if not res.get("confirmed"):
+        # No confirmed fill => no position. Recording one would have the monitor
+        # trying to sell tokens the wallet may never have received.
+        return {
+            "paper": False,
+            "action": "BUY",
+            "mint": mint,
+            "token_amount": 0,
+            "quote_failed": True,
+            "note": f"live buy not confirmed: {res.get('status') or res.get('error')}",
+            "signature": res.get("signature", ""),
+        }
     return {
         "paper": False,
         "action": "BUY",
         "mint": mint,
         "token_amount": _out_amount(order),
-        "result": result,
+        "signature": res.get("signature", ""),
+        "result": res,
     }
 
 
@@ -157,12 +241,21 @@ async def sell_token(mint: str, token_amount: int) -> dict:
             "token_amount": token_amount,
             "note": "DRY-RUN: no real transaction sent",
         }
-    order = await _order(mint, WSOL, token_amount)
-    result = await _submit(order)
-    return {
+    order = await _order(mint, WSOL, token_amount,
+                         taker=load_keypair().pubkey().__str__())
+    res = await _submit(order)
+    out = {
         "paper": False,
         "action": "SELL",
         "mint": mint,
-        "sol_out": _out_amount(order) / LAMPORTS,
-        "result": result,
+        "confirmed": bool(res.get("confirmed")),
+        "signature": res.get("signature", ""),
+        "result": res,
     }
+    # Only claim proceeds for a confirmed sale; an unconfirmed one leaves the
+    # position open on purpose so the monitor retries instead of booking P&L.
+    if res.get("confirmed"):
+        out["sol_out"] = _out_amount(order) / LAMPORTS
+    else:
+        out["note"] = f"live sell not confirmed: {res.get('status') or res.get('error')}"
+    return out
