@@ -5,9 +5,15 @@ test_dashboard_fixes.py - Verifies the dashboard/telemetry/discovery fixes:
      `Program data:` log line -> zero getTransaction calls; trades and failed txs
      are never mistaken for launches; each mint/signature is handled once.
   1b. an undecodable pump.fun event still falls back to getTransaction.
+  1c. a mint whose metadata is not indexed yet is RETRIED, not dropped forever.
+  1d. a slow metadata fetch cannot stall the WebSocket read loop.
   2-4. KPI invariant: passed + skipped == scanned (exactly one token_eval verdict
      per token_new), including the max-positions and LLM-reject paths.
   5. Re-delivered tokens already held as positions emit no telemetry at all.
+  6. Paper entries are priced from a REAL Jupiter quote and are refused (no
+     position, no fake P&L) when the token has no route yet.
+  7. Position monitoring marks to market with real sell quotes, tolerates a
+     transient quote failure, and abandons a position that stays unpriceable.
 
 Pure unit tests - no network, no RPC, no real trades. Run:
     .venv/Scripts/python.exe test_dashboard_fixes.py
@@ -28,6 +34,11 @@ cfg.LLM_ANALYSIS_ENABLED = False
 import snipe
 import ws_listener
 from telemetry import tel
+
+# reset_bot() stubs snipe.monitor_position with a no-op so the token-intake tests
+# never fire real Jupiter quotes. Capture the genuine coroutine here, before any
+# stubbing, so the monitor tests can exercise the real mark-to-market loop.
+_REAL_MONITOR = snipe.monitor_position
 
 FAILURES = []
 
@@ -218,12 +229,16 @@ async def test_ws_fallback_rpc():
     ws_listener._fetch_token_meta = fake_meta
 
     got = []
+
+    async def on_token(m):
+        got.append(m)
+
     fake = FakeWS([notification("sigX", weird)])
     fake_mod = type(sys)("websockets")
     fake_mod.connect = lambda url: fake
     sys.modules["websockets"] = fake_mod
     try:
-        await asyncio.wait_for(ws_listener.ws_listen(got.append, reconnect_delay=0.01), 5)
+        await asyncio.wait_for(ws_listener.ws_listen(on_token, reconnect_delay=0.01), 5)
     except (asyncio.TimeoutError, _StopFeed):
         pass
     finally:
@@ -232,6 +247,172 @@ async def test_ws_fallback_rpc():
     check("fallback made exactly one RPC call", rpc_calls == ["sigX"], rpc_calls)
     check("fallback still yields the mint",
           [m["mint"] for m in got] == [MINT], got)
+
+
+async def test_known_event_beside_unknown_blob_is_not_a_launch():
+    """The frame that flooded the live run: a TradeEvent riding alongside an
+    unrecognised blob from a router / CPI caller. Any recognised event proves the
+    tx is not a launch, so it must cost ZERO RPC calls. Treating these as
+    'maybe a launch' queued a fallback job per trade and swamped the queue.
+    """
+    print("test 1e: recognised event + unknown blob costs no RPC")
+    import base64
+    import pumpfun_events as E
+
+    mixed = [
+        f"Program {ws_listener.PUMP_PROGRAM} invoke [1]",
+        "Program data: " + base64.b64encode(E.TRADE_EVENT + os.urandom(96)).decode(),
+        "Program data: " + base64.b64encode(os.urandom(8) + os.urandom(40)).decode(),
+    ]
+    check("mixed frame is not flagged as a possible launch",
+          not E.has_unknown_event(mixed))
+    check("wholly unrecognised frame still is",
+          E.has_unknown_event(
+              ["Program data: " + base64.b64encode(os.urandom(48)).decode()]))
+
+    rpc_calls = []
+
+    async def fake_get_tx(sig):
+        rpc_calls.append(sig)
+        return {}
+
+    ws_listener._get_transaction = fake_get_tx
+    ws_listener._fetch_token_meta = lambda m: _amint(m)
+
+    got = []
+
+    async def on_token(m):
+        got.append(m)
+
+    fake = FakeWS([notification("sigMix", mixed)])
+    fake_mod = type(sys)("websockets")
+    fake_mod.connect = lambda url: fake
+    sys.modules["websockets"] = fake_mod
+    try:
+        await asyncio.wait_for(ws_listener.ws_listen(on_token, reconnect_delay=0.01), 5)
+    except (asyncio.TimeoutError, _StopFeed):
+        pass
+    finally:
+        sys.modules.pop("websockets", None)
+
+    check("no RPC fallback for a trade frame", rpc_calls == [], rpc_calls)
+    check("nothing forwarded", got == [], got)
+
+
+async def _amint(mint):
+    return {"mint": mint}
+
+
+# ---------------------------------------------------------------- test 1c
+async def test_enrich_retries_unindexed_mint():
+    """A brand-new mint is usually not indexed yet: pump.fun's API is Cloudflare
+    blocked and DexScreener has no pair for a few seconds. The old code marked
+    the mint seen BEFORE fetching metadata, so that first miss discarded the
+    launch permanently - only tokens old enough to be indexed could be bought,
+    the exact opposite of sniping. Enrichment must retry and still deliver."""
+    print("test 1c: not-yet-indexed mint is retried, not dropped forever")
+    import pumpfun_events as E
+
+    raw = os.urandom(32)
+    MINT = E.b58encode(raw)
+
+    attempts = {"n": 0}
+
+    async def flaky_meta(mint):
+        # Fails the first two times (not indexed yet), then succeeds.
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return None
+        return {"mint": mint, "usd_market_cap": 9000}
+
+    async def fake_get_tx(sig):
+        raise AssertionError("must not call getTransaction for a decoded create")
+
+    ws_listener._fetch_token_meta = flaky_meta
+    ws_listener._get_transaction = fake_get_tx
+    orig_delay = ws_listener.ENRICH_RETRY_DELAY
+    ws_listener.ENRICH_RETRY_DELAY = 0.01  # keep the test fast
+
+    forwarded = []
+
+    async def on_token(m):
+        forwarded.append(m)
+
+    fake = FakeWS([notification("sigR", create_logs(raw, "Late", "LATE"))])
+    fake_mod = type(sys)("websockets")
+    fake_mod.connect = lambda url: fake
+    sys.modules["websockets"] = fake_mod
+    try:
+        await asyncio.wait_for(ws_listener.ws_listen(on_token, reconnect_delay=0.01), 5)
+    except (asyncio.TimeoutError, _StopFeed):
+        pass
+    finally:
+        sys.modules.pop("websockets", None)
+        ws_listener.ENRICH_RETRY_DELAY = orig_delay
+
+    check("retried until metadata appeared", attempts["n"] == 3, f"attempts={attempts['n']}")
+    check("mint delivered exactly once despite retries",
+          [m["mint"] for m in forwarded] == [MINT], forwarded)
+    check("identity taken from the on-chain event",
+          forwarded and forwarded[0].get("symbol") == "LATE", forwarded[:1])
+
+
+async def test_reader_not_blocked_by_slow_enrichment():
+    """Enrichment must not run on the socket read path. Awaiting HTTP inline is
+    what produced 538 `keepalive ping timeout` disconnects in the run log: while
+    the fetch was pending the loop stopped reading frames and missed the
+    server's ping. The reader should consume the whole feed while a slow fetch
+    is still in flight."""
+    print("test 1d: slow metadata fetch does not stall the reader")
+    import pumpfun_events as E
+
+    raws = [os.urandom(32) for _ in range(5)]
+    MINTS = [E.b58encode(r) for r in raws]
+    read_done = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_meta(mint):
+        # Block until the reader has drained the feed, proving it kept reading.
+        try:
+            await asyncio.wait_for(read_done.wait(), timeout=2)
+        except asyncio.TimeoutError:
+            pass
+        release.set()
+        return {"mint": mint}
+
+    ws_listener._fetch_token_meta = slow_meta
+
+    class SignallingWS(FakeWS):
+        def __aiter__(self):
+            async def gen():
+                for m in self._messages:
+                    yield m
+                read_done.set()          # reader reached end of feed
+                await release.wait()     # keep the connection open
+                raise _StopFeed()
+            return gen()
+
+    forwarded = []
+
+    async def on_token(m):
+        forwarded.append(m)
+
+    fake = SignallingWS([notification(f"s{i}", create_logs(r))
+                         for i, r in enumerate(raws)])
+    fake_mod = type(sys)("websockets")
+    fake_mod.connect = lambda url: fake
+    sys.modules["websockets"] = fake_mod
+    try:
+        await asyncio.wait_for(ws_listener.ws_listen(on_token, reconnect_delay=0.01), 8)
+    except (asyncio.TimeoutError, _StopFeed):
+        pass
+    finally:
+        sys.modules.pop("websockets", None)
+
+    check("reader drained the feed while a fetch was pending", read_done.is_set())
+    check("all 5 mints still enriched and forwarded",
+          sorted(m["mint"] for m in forwarded) == sorted(MINTS),
+          f"got {len(forwarded)}")
 
 
 # ---------------------------------------------------------------- test 2
@@ -304,13 +485,186 @@ async def test_held_position_not_rescanned():
     check("buys still 1", tel.stats["buys"] == 1, f"buys={tel.stats['buys']}")
 
 
+# ---------------------------------------------------------------- tests 6-7
+async def test_paper_entry_requires_real_quote():
+    """Paper mode must size entries from a REAL Jupiter buy quote. When a mint
+    has no route yet the buy returns quote_failed and we must NOT open a
+    position - inventing a holding is what produces imaginary P&L."""
+    print("test 6: paper entry refused when the token cannot be priced")
+    reset_bot((True, "ok"))
+
+    async def _no_route_buy(mint, sol):
+        import jupiter
+        # exercise the real paper branch with the quote returning None
+        jupiter.get_buy_quote = lambda *_a, **_k: _async_none()
+        return await jupiter.buy_token(mint, sol)
+
+    async def _async_none():
+        return None
+
+    snipe.buy_token = _no_route_buy
+    await snipe.handle_new_token(meta("NOROUTE", "Ghost"))
+
+    s = tel.stats
+    check("no position opened", "NOROUTE" not in snipe.positions, snipe.positions)
+    check("no buy counted", s["buys"] == 0, f"buys={s['buys']}")
+    check("counted as a skip, invariant holds",
+          s["passed"] + s["skipped"] == s["scanned"] and s["skipped"] == 1,
+          f"passed={s['passed']} skipped={s['skipped']} scanned={s['scanned']}")
+    check("no P&L recorded", tel.stats["realized_pnl_sol"] == 0.0)
+
+
+def _install_position(mint="MTM", buy_sol=0.1, tokens=1_000_000):
+    """Put a position in place as if a paper buy had just filled."""
+    import time as _t
+    snipe.positions[mint] = {
+        "bought_at": _t.time(), "buy_sol": buy_sol, "token_amount": tokens,
+        "paper": True, "meta": {"name": "MarkToMarket"},
+    }
+    return mint
+
+
+class CaptureWS:
+    """Fake dashboard subscriber that records every broadcast payload.
+
+    Exit events are NOT appended to tel.feed (only token_new is, see
+    telemetry.emit), so asserting on the broadcast stream is both the correct
+    place to look and the same data a real browser client receives.
+    """
+
+    def __init__(self):
+        self.events = []
+
+    async def send(self, msg):
+        import json
+        self.events.append(json.loads(msg))
+
+    def of_type(self, kind):
+        return [e for e in self.events if e.get("type") == kind]
+
+    def __enter__(self):
+        tel.subscribers.add(self)
+        return self
+
+    def __exit__(self, *a):
+        tel.subscribers.discard(self)
+        return False
+
+
+async def test_monitor_marks_to_market():
+    """TP must fire off a real sell quote, not a random walk. 0.25 SOL back on a
+    0.1 SOL entry is 2.5x, above TAKE_PROFIT_MULTIPLE=2.0."""
+    print("test 7: monitor exits on a real sell quote (TP)")
+    reset_bot((True, "ok"))
+    cfg.SELL_DELAY_SEC = 0
+    cfg.PRICE_CHECK_SEC = 0.01
+    mint = _install_position()
+
+    async def quote(_mint, _amount):
+        return 0.25  # 2.5x on a 0.1 SOL entry
+
+    sells = []
+
+    async def _sell(m, amt):
+        sells.append((m, amt))
+        return {"paper": True, "action": "SELL"}
+
+    snipe.get_sell_quote = quote
+    snipe.sell_token = _sell
+    with CaptureWS() as cap:
+        await asyncio.wait_for(_REAL_MONITOR(mint), 5)
+
+    check("take-profit fired", tel.stats["exits_tp"] == 1, f"tp={tel.stats['exits_tp']}")
+    check("no stop-loss", tel.stats["exits_sl"] == 0)
+    check("sell was attempted with the held amount",
+          sells == [(mint, 1_000_000)], sells)
+    check("position closed", mint not in snipe.positions)
+    rows = cap.of_type("exit_tp")
+    check("exit multiple came from the quote (2.5x)",
+          len(rows) == 1 and abs(rows[0]["multiple"] - 2.5) < 1e-6, rows)
+    ticks = cap.of_type("position_tick")
+    check("tick multiple is quote-derived, not simulated",
+          ticks and all(abs(t["multiple"] - 2.5) < 1e-6 for t in ticks), ticks[:2])
+
+
+async def test_monitor_tolerates_transient_quote_failure():
+    """A single failed quote is routine (API hiccup) and must not be read as a
+    price collapse - the position stays open and prices normally next tick."""
+    print("test 7b: one failed quote does not close the position")
+    reset_bot((True, "ok"))
+    cfg.SELL_DELAY_SEC = 0
+    cfg.PRICE_CHECK_SEC = 0.01
+    mint = _install_position()
+
+    calls = {"n": 0}
+
+    async def flaky_quote(_mint, _amount):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return None          # transient failure
+        return 0.25              # then a real 2.5x
+
+    async def _sell(m, amt):
+        return {"paper": True}
+
+    snipe.get_sell_quote = flaky_quote
+    snipe.sell_token = _sell
+    await asyncio.wait_for(_REAL_MONITOR(mint), 5)
+
+    check("survived the transient failures", calls["n"] == 3, f"calls={calls['n']}")
+    check("exited on take-profit, not stop-loss",
+          tel.stats["exits_tp"] == 1 and tel.stats["exits_sl"] == 0,
+          f"tp={tel.stats['exits_tp']} sl={tel.stats['exits_sl']}")
+
+
+async def test_monitor_abandons_unpriceable_position():
+    """A position that stays unpriceable (liquidity pulled / rugged) must be
+    abandoned as a total loss rather than monitored forever."""
+    print("test 7c: persistently unpriceable position is abandoned at 0x")
+    reset_bot((True, "ok"))
+    cfg.SELL_DELAY_SEC = 0
+    cfg.PRICE_CHECK_SEC = 0.01
+    mint = _install_position()
+
+    async def dead_quote(_mint, _amount):
+        return None
+
+    snipe.get_sell_quote = dead_quote
+    with CaptureWS() as cap:
+        # Bounded: an unpriceable position must be abandoned, not monitored
+        # forever. A timeout here IS the failure, so report it as one rather
+        # than letting it escape as a traceback.
+        try:
+            await asyncio.wait_for(_REAL_MONITOR(mint), 5)
+        except asyncio.TimeoutError:
+            snipe.positions.pop(mint, None)
+            check("position abandoned instead of monitored forever", False,
+                  "monitor never exited")
+
+    check("position abandoned", mint not in snipe.positions)
+    check("recorded as a loss", tel.stats["exits_sl"] == 1, f"sl={tel.stats['exits_sl']}")
+    rows = cap.of_type("exit_sl")
+    check("marked 0x with an 'unpriceable' reason",
+          len(rows) == 1 and rows[0]["multiple"] == 0.0
+          and rows[0].get("reason") == "unpriceable", rows)
+    check("no phantom exit before the failure budget was spent",
+          not cap.of_type("position_tick"), cap.of_type("position_tick")[:2])
+
+
 async def main():
     await test_ws_dedup()
     await test_ws_fallback_rpc()
+    await test_known_event_beside_unknown_blob_is_not_a_launch()
+    await test_enrich_retries_unindexed_mint()
+    await test_reader_not_blocked_by_slow_enrichment()
     await test_kpi_invariant_max_positions()
     await test_kpi_invariant_filter_reject()
     await test_kpi_invariant_llm_reject()
     await test_held_position_not_rescanned()
+    await test_paper_entry_requires_real_quote()
+    await test_monitor_marks_to_market()
+    await test_monitor_tolerates_transient_quote_failure()
+    await test_monitor_abandons_unpriceable_position()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")

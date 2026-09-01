@@ -22,6 +22,11 @@ class Config:
         f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY', '')}",
     )
     JUPITER_ULTRA_URL = os.getenv("JUPITER_ULTRA_URL", "https://lite-api.jup.ag/ultra/v1")
+    # Slippage tolerance for quotes AND live swaps, in basis points (100 = 1%).
+    # 50 bps was hardcoded before; that is far too tight for a fresh pump.fun
+    # token and would make most live swaps fail. Paper mode uses the same value
+    # so quoted prices reflect what a live fill would actually tolerate.
+    SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "1000"))
 
     # Wallet
     WALLET_PRIVATE_KEY = os.getenv("WALLET_PRIVATE_KEY", "")
@@ -83,6 +88,16 @@ class Config:
     MIN_PRICE_CHANGE_H1_PCT = float(os.getenv("MIN_PRICE_CHANGE_H1_PCT", "0"))
     # Pair must be at least this many seconds old (skip brand-new, unproven pairs).
     MIN_PAIR_AGE_SEC = int(os.getenv("MIN_PAIR_AGE_SEC", "0"))
+
+    # --- Anti-rug gates -----------------------------------------------------
+    # Max share of the circulating float (bonding curve excluded) a single
+    # wallet may hold. A dev/bundle holding most of the float can dump it in one
+    # tx. 0 disables the check (and saves one RPC call per token).
+    MAX_TOP_HOLDER_PCT = float(os.getenv("MAX_TOP_HOLDER_PCT", "0"))
+    # Minimum % of BUY_AMOUNT_SOL recoverable by immediately selling back.
+    # Catches honeypots (no sell route at all) and liquidity too thin to exit.
+    # Healthy pump.fun tokens sit around 88-95%. 0 disables (2 quotes per token).
+    MIN_ROUND_TRIP_PCT = float(os.getenv("MIN_ROUND_TRIP_PCT", "0"))
 
     @classmethod
     def validate(cls):

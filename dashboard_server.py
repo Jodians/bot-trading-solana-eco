@@ -14,6 +14,7 @@ Run via `python run_dashboard.py` (which imports this). Default:
     ws://localhost:8766     (telemetry stream)
 """
 import json
+import os
 import pathlib
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,13 @@ from telemetry import tel
 HTML_PATH = pathlib.Path(__file__).with_name("dashboard.html")
 HTTP_PORT = 8765
 WS_PORT = 8766
+
+# Bind loopback by default. Both servers are UNAUTHENTICATED and the WebSocket
+# accepts control commands (pause / resume / clear_feed), so binding 0.0.0.0
+# handed anyone on the LAN read access to your telemetry and the ability to
+# pause the bot. Override with DASHBOARD_HOST=0.0.0.0 only on a network you
+# trust, and understand there is still no auth.
+DEFAULT_HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -73,16 +81,16 @@ async def _ws_handler(websocket):
         tel.subscribers.discard(websocket)
 
 
-def start_http():
-    httpd = ThreadingHTTPServer(("0.0.0.0", HTTP_PORT), _Handler)
+def start_http(host: str = DEFAULT_HOST):
+    httpd = ThreadingHTTPServer((host, HTTP_PORT), _Handler)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     return httpd
 
 
-async def serve_dashboard(host: str = "0.0.0.0", port: int = WS_PORT):
+async def serve_dashboard(host: str = DEFAULT_HOST, port: int = WS_PORT):
     # HTTP server runs in a background thread (stdlib, no asyncio needed).
-    httpd = start_http()
+    httpd = start_http(host)
     # WebSocket server runs on the asyncio loop.
     ws_server = await serve(_ws_handler, host, port)
     return ws_server, httpd

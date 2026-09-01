@@ -12,7 +12,6 @@ By default LIVE_TRADING=false -> buys/sells are paper/dry-run. No real funds
 move. Read config.py / .env.example before enabling live trading.
 """
 import asyncio
-import random
 import time
 from datetime import datetime
 
@@ -29,6 +28,11 @@ from telemetry import tel
 positions = {}
 # Guard so a position is only being monitored by one task.
 _monitors = set()
+
+# How many consecutive unpriceable checks before we abandon a position. A single
+# failed quote is routine (API hiccup, momentary no-route); a long run of them
+# means liquidity is gone. At PRICE_CHECK_SEC=10 this is ~1 minute of silence.
+MAX_QUOTE_FAILURES = 6
 
 
 async def handle_new_token(meta: dict):
@@ -77,12 +81,22 @@ async def handle_new_token(meta: dict):
                 notify(f"🚫 <b>SKIP (LLM)</b> {name}\n{verdict['reason']}")
             return
 
-    await tel.emit({"type": "token_eval", "mint": mint, "name": name,
-                    "passed": True, "reason": reason})
-
     print(f"    -> PASS ({reason}) -> attempting buy (paper={not cfg.LIVE_TRADING})")
     result = await buy_token(mint, cfg.BUY_AMOUNT_SOL)
     token_amount = result.get("token_amount", 0)
+
+    # A paper buy is priced off a REAL Jupiter quote. If there is no route yet
+    # we must not invent a holding - an imaginary position would produce
+    # imaginary P&L, which is the whole thing we are trying to avoid.
+    if result.get("quote_failed") or token_amount <= 0:
+        print("    -> SKIP (no Jupiter route/liquidity yet - cannot price entry)")
+        await tel.emit({"type": "token_eval", "mint": mint, "name": name,
+                        "passed": False, "reason": "no Jupiter route (unpriceable)"})
+        return
+
+    await tel.emit({"type": "token_eval", "mint": mint, "name": name,
+                    "passed": True, "reason": reason})
+
     print(f"    -> buy result: paper={result.get('paper')} tokens={token_amount}")
     if tg_enabled():
         mode = "LIVE" if not result.get("paper") else "PAPER"
@@ -119,39 +133,53 @@ def decide_exit(multiple: float) -> str:
 
 async def monitor_position(mint: str):
     """
-    Poll price via Jupiter sell-quote; exit on TP or SL multiple.
-    Paper mode: quotes are real (read-only) but sells stay DRY-RUN.
+    Mark the position to market via a REAL Jupiter sell-quote and exit on TP/SL.
+
+    Paper and live use the SAME pricing path - quotes are read-only, so paper
+    mode is honest about what the market would pay; only the sell submission is
+    gated. This replaced a `random.uniform(-0.04, 0.05)` simulated walk whose
+    mean drift was +0.5%/tick: over 2000 simulated positions it hit take-profit
+    99.9% of the time, and the live run showed 105 TP / 0 SL. That curve
+    measured the RNG's bias, not any edge, so it was worse than no curve at all.
+
+    A quote can transiently fail (no route, API hiccup). Those are tolerated;
+    only a sustained inability to price the position closes it out, so a blip
+    cannot be mistaken for a price collapse.
     """
     await asyncio.sleep(cfg.SELL_DELAY_SEC)
+    consecutive_quote_failures = 0
     try:
         while mint in positions:
             pos = positions[mint]
             token_amount = pos.get("token_amount", 0)
-            is_paper = pos.get("paper", True)
 
-            if is_paper:
-                # --- PAPER DRY-RUN: no real on-chain holding, so simulate a
-                # price random-walk to exercise TP/SL + the dashboard. This
-                # avoids hitting Jupiter with the dummy paper amount (which
-                # returns HTTP 400) and lets paper positions actually exit. ---
-                if "paper_mult" not in pos:
-                    pos["paper_mult"] = 1.0
-                drift = random.uniform(-0.04, 0.05)
-                pos["paper_mult"] = max(0.05, min(5.0, pos["paper_mult"] + drift))
-                multiple = pos["paper_mult"]
-            else:
-                if token_amount <= 0:
-                    # Real holding but amount unknown -> age out after a while.
-                    if time.time() - pos["bought_at"] > 300:
-                        print(f"[{datetime.now():%H:%M:%S}] {mint}: sim expired, closing")
-                        del positions[mint]
-                    await asyncio.sleep(cfg.PRICE_CHECK_SEC)
-                    continue
-                sol_out = await get_sell_quote(mint, token_amount)
-                if sol_out is None:
-                    await asyncio.sleep(cfg.PRICE_CHECK_SEC)
-                    continue
-                multiple = sol_out / pos["buy_sol"] if pos["buy_sol"] else 0.0
+            if token_amount <= 0:
+                # Should not happen: handle_new_token refuses unpriceable entries.
+                print(f"[{datetime.now():%H:%M:%S}] {mint}: no token amount, closing")
+                del positions[mint]
+                break
+
+            sol_out = await get_sell_quote(mint, token_amount)
+            if sol_out is None:
+                consecutive_quote_failures += 1
+                if consecutive_quote_failures >= MAX_QUOTE_FAILURES:
+                    print(f"[{datetime.now():%H:%M:%S}] {mint}: unpriceable for "
+                          f"{consecutive_quote_failures} checks (likely rugged / "
+                          "liquidity pulled) -> abandoning position")
+                    await tel.emit({"type": "exit_sl", "mint": mint,
+                                    "name": pos.get("meta", {}).get("name", mint),
+                                    "multiple": 0.0, "paper": pos.get("paper", True),
+                                    "reason": "unpriceable"})
+                    if tg_enabled():
+                        notify_exit_pnl(pos.get("meta", {}).get("name", mint), 0.0,
+                                        pos.get("buy_sol", 0.0), "SL")
+                    del positions[mint]
+                    break
+                await asyncio.sleep(cfg.PRICE_CHECK_SEC)
+                continue
+
+            consecutive_quote_failures = 0
+            multiple = sol_out / pos["buy_sol"] if pos["buy_sol"] else 0.0
 
             decision = decide_exit(multiple)
             print(f"[{datetime.now():%H:%M:%S}] {mint}: now {multiple:.2f}x (TP {cfg.TAKE_PROFIT_MULTIPLE} / SL {cfg.STOP_LOSS_MULTIPLE}) {decision}")
@@ -159,21 +187,23 @@ async def monitor_position(mint: str):
                            "name": pos.get("meta", {}).get("name", mint),
                            "multiple": round(multiple, 3), "decision": decision})
 
-            if decision == "TP":
-                print(f"    -> TAKE PROFIT @ {multiple:.2f}x -> selling")
+            if decision in ("TP", "SL"):
+                label = "TAKE PROFIT" if decision == "TP" else "STOP LOSS"
+                print(f"    -> {label} @ {multiple:.2f}x -> selling")
                 res = await sell_token(mint, token_amount)
                 print(f"    -> sell result: paper={res.get('paper')}")
-                await tel.emit({"type": "exit_tp", "mint": mint, "name": pos.get("meta", {}).get("name", mint), "multiple": round(multiple, 3), "paper": res.get("paper", True)})
+                # A live fill reports what it actually received; prefer it over
+                # the quote so realized P&L reflects the real execution.
+                filled = res.get("sol_out")
+                if filled and pos.get("buy_sol"):
+                    multiple = filled / pos["buy_sol"]
+                await tel.emit({"type": f"exit_{decision.lower()}", "mint": mint,
+                                "name": pos.get("meta", {}).get("name", mint),
+                                "multiple": round(multiple, 3),
+                                "paper": res.get("paper", True)})
                 if tg_enabled():
-                    notify_exit_pnl(pos.get("meta", {}).get("name", mint), multiple, pos.get("buy_sol", 0.0), "TP")
-                del positions[mint]
-            elif decision == "SL":
-                print(f"    -> STOP LOSS @ {multiple:.2f}x -> selling (cut)")
-                res = await sell_token(mint, token_amount)
-                print(f"    -> sell result: paper={res.get('paper')}")
-                await tel.emit({"type": "exit_sl", "mint": mint, "name": pos.get("meta", {}).get("name", mint), "multiple": round(multiple, 3), "paper": res.get("paper", True)})
-                if tg_enabled():
-                    notify_exit_pnl(pos.get("meta", {}).get("name", mint), multiple, pos.get("buy_sol", 0.0), "SL")
+                    notify_exit_pnl(pos.get("meta", {}).get("name", mint), multiple,
+                                    pos.get("buy_sol", 0.0), decision)
                 del positions[mint]
             else:
                 await asyncio.sleep(cfg.PRICE_CHECK_SEC)

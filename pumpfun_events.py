@@ -131,13 +131,21 @@ def extract_new_mint(logs) -> dict | None:
 
 
 def has_unknown_event(logs) -> bool:
-    """True if a `Program data:` blob carries a discriminator we do not know.
+    """True if this frame *might* be a launch we failed to decode.
 
-    Callers use this to decide whether a frame is worth an RPC fallback: a
-    recognised non-create event (a trade, a curve completion) is definitively
-    *not* a launch, so fetching the transaction would be wasted. An unknown tag
-    means the program was upgraded and we should not silently miss the launch.
+    Used to decide whether a frame is worth an RPC fallback. Two ways to be sure
+    it is not worth one:
+
+      * it carries a recognised event (TradeEvent / CompleteEvent / SetParams) -
+        those are definitively not launches, even when an unrecognised blob rides
+        along in the same transaction (routers, fee hooks and CPI callers all add
+        their own event data). This is the common case by a wide margin.
+      * every blob is recognised - nothing to resolve.
+
+    Only a frame that is *entirely* unrecognised suggests the program was
+    upgraded and a launch could be hiding in it.
     """
-    return any(
-        len(p) >= 8 and p[:8] not in KNOWN_EVENTS for p in iter_program_data(logs)
-    )
+    payloads = [p for p in iter_program_data(logs) if len(p) >= 8]
+    if not payloads:
+        return False
+    return all(p[:8] not in KNOWN_EVENTS for p in payloads)

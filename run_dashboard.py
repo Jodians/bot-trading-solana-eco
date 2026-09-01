@@ -35,11 +35,16 @@ async def main():
     # Seed the P&L equity curve at zero so the chart has a starting point.
     tel.record_equity()
 
-    server = await dashboard_server.serve_dashboard("0.0.0.0", 8766)
+    # Binds 127.0.0.1 by default (see dashboard_server.DEFAULT_HOST). There is
+    # no auth on either port and the WS accepts control commands, so exposing
+    # it beyond loopback needs a deliberate DASHBOARD_HOST=0.0.0.0.
+    host = dashboard_server.DEFAULT_HOST
+    server = await dashboard_server.serve_dashboard(host, dashboard_server.WS_PORT)
     print("=" * 60)
-    print(f"  Dashboard  : http://localhost:8765  (mode={tel.stats['mode']})")
-    print(f"  WS stream  : ws://localhost:8766")
+    print(f"  Dashboard  : http://127.0.0.1:{dashboard_server.HTTP_PORT}  (mode={tel.stats['mode']})")
+    print(f"  WS stream   : ws://127.0.0.1:{dashboard_server.WS_PORT}  (bind={host})")
     print(f"  Bot        : snipe.py (LLM gate={'on' if cfg.LLM_ANALYSIS_ENABLED else 'off'})")
+    print(f"  Pricing    : real Jupiter quotes (slippage {cfg.SLIPPAGE_BPS} bps)")
     print("=" * 60)
 
     # Run the bot loop as a background task. It runs forever (poll/WS loop).
