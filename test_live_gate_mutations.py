@@ -217,12 +217,113 @@ def m_restored_rewaits():
     cfg.SELL_DELAY_SEC = 0
 
 
+# --------------------------------------------------------------- mutation 6
+def m_absent_txns_is_zero():
+    """Restore `int(meta.get("txns_h1") or 0)`: a fresh mint that reports no
+    momentum fields at all should then be rejected for having 0 txns - the bug
+    that skipped 26928 of 27278 tokens in one run."""
+    print("mutation 6: an absent txns_h1 counts as zero again")
+    import filters
+
+    saved = (cfg.MIN_TXNS_H1, cfg.MIN_CURVE_SOL, cfg.MAX_DEV_SHARE_PCT,
+             cfg.MAX_TOP_HOLDER_PCT, cfg.MIN_ROUND_TRIP_PCT,
+             cfg.REQUIRE_MINT_RENOUNCED, cfg.REQUIRE_FREEZE_RENOUNCED)
+    cfg.MIN_TXNS_H1 = 2
+    cfg.MIN_CURVE_SOL = cfg.MAX_DEV_SHARE_PCT = cfg.MAX_TOP_HOLDER_PCT = 0
+    cfg.MIN_ROUND_TRIP_PCT = 0
+    cfg.REQUIRE_MINT_RENOUNCED = cfg.REQUIRE_FREEZE_RENOUNCED = False
+
+    real = filters.evaluate_token
+
+    async def old_eval(meta):
+        txns = int(meta.get("txns_h1") or meta.get("txns_24h") or 0)
+        if cfg.MIN_TXNS_H1 and txns < cfg.MIN_TXNS_H1:
+            return (False, f"txns_h1 {txns} < min {cfg.MIN_TXNS_H1}")
+        return await real(meta)
+
+    filters.evaluate_token = old_eval
+    try:
+        ok, why = asyncio.run(filters.evaluate_token(
+            {"mint": "M" * 43, "usd_market_cap": 5000}))
+        expect_caught("a fresh mint is skipped for phantom zero txns", not ok, why)
+    finally:
+        filters.evaluate_token = real
+        (cfg.MIN_TXNS_H1, cfg.MIN_CURVE_SOL, cfg.MAX_DEV_SHARE_PCT,
+         cfg.MAX_TOP_HOLDER_PCT, cfg.MIN_ROUND_TRIP_PCT,
+         cfg.REQUIRE_MINT_RENOUNCED, cfg.REQUIRE_FREEZE_RENOUNCED) = saved
+
+
+# --------------------------------------------------------------- mutation 7
+def m_no_dev_share_gate():
+    """Disable MAX_DEV_SHARE_PCT: a creator holding 90% of the sold float - one
+    transaction away from dumping it - should then sail through."""
+    print("mutation 7: MAX_DEV_SHARE_PCT disabled")
+    import filters
+
+    saved = (cfg.MAX_DEV_SHARE_PCT, cfg.MAX_TOP_HOLDER_PCT,
+             cfg.MIN_ROUND_TRIP_PCT, cfg.MIN_CURVE_SOL,
+             cfg.REQUIRE_MINT_RENOUNCED, cfg.REQUIRE_FREEZE_RENOUNCED)
+    cfg.MAX_DEV_SHARE_PCT = 0                     # the mutation
+    cfg.MAX_TOP_HOLDER_PCT = cfg.MIN_ROUND_TRIP_PCT = cfg.MIN_CURVE_SOL = 0
+    cfg.REQUIRE_MINT_RENOUNCED = cfg.REQUIRE_FREEZE_RENOUNCED = False
+
+    real_post = filters.post_rpc
+
+    async def dev_holds_almost_everything(payload, timeout=10.0):
+        return {"result": {"value": {"amount": "900000"}}}
+
+    filters.post_rpc = dev_holds_almost_everything
+    try:
+        ok, why = asyncio.run(filters.evaluate_token({
+            "mint": "So11111111111111111111111111111111111111112",
+            "creator": "11111111111111111111111111111111",
+            "token_program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "usd_market_cap": 5000,
+            "real_token_reserves": filters.CURVE_INITIAL_TOKENS - 1_000_000}))
+        expect_caught("a dev holding 90% of the float now passes", ok, why)
+    finally:
+        filters.post_rpc = real_post
+        (cfg.MAX_DEV_SHARE_PCT, cfg.MAX_TOP_HOLDER_PCT,
+         cfg.MIN_ROUND_TRIP_PCT, cfg.MIN_CURVE_SOL,
+         cfg.REQUIRE_MINT_RENOUNCED, cfg.REQUIRE_FREEZE_RENOUNCED) = saved
+
+
+# --------------------------------------------------------------- mutation 8
+def m_rug_check_fails_open():
+    """Restore fail-open: with every RPC endpoint refusing the call, an unknown
+    holder distribution should then be treated as safe - which is how the
+    anti-rug layer silently switched itself off in the first place."""
+    print("mutation 8: rug checks fail open on RPC failure")
+    import filters
+    import httpx
+
+    saved = (cfg.MAX_TOP_HOLDER_PCT, cfg.RUG_CHECK_FAIL_OPEN)
+    cfg.MAX_TOP_HOLDER_PCT = 60
+    cfg.RUG_CHECK_FAIL_OPEN = True                # the mutation
+
+    real_post = filters.post_rpc
+
+    async def rpc_down(payload, timeout=10.0):
+        raise httpx.ConnectError("all endpoints refused")
+
+    filters.post_rpc = rpc_down
+    try:
+        ok, why = asyncio.run(filters.check_holder_concentration("M" * 43))
+        expect_caught("an unverifiable token is treated as safe", ok, why)
+    finally:
+        filters.post_rpc = real_post
+        (cfg.MAX_TOP_HOLDER_PCT, cfg.RUG_CHECK_FAIL_OPEN) = saved
+
+
 if __name__ == "__main__":
     m_no_timeout()
     m_no_funds_gate()
     m_no_confirmation()
     m_no_persist()
     m_restored_rewaits()
+    m_absent_txns_is_zero()
+    m_no_dev_share_gate()
+    m_rug_check_fails_open()
     if os.path.exists(positions_store.PATH):
         os.unlink(positions_store.PATH)
     missed = [n for n, ok in RESULTS if not ok]

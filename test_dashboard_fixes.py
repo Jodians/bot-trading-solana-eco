@@ -1119,6 +1119,243 @@ async def test_maintenance_events_are_recognised():
           and E.decode_create_event(observed + os.urandom(40)) is None)
 
 
+async def test_absent_momentum_field_is_not_zero():
+    """The bug that produced 26928 of 27278 skips - a 98.7% rejection rate.
+
+    txns_h1 / liquidity_usd / price_change_h1 come from DexScreener, which has no
+    pair for a token seconds old. Probed live: all three were absent on 30 of 30
+    consecutive launches while usd_market_cap was present 30/30. The old code read
+    `int(meta.get("txns_h1") or 0)`, so every fresh token scored 0 and MIN_TXNS_H1
+    rejected it for a reason that had nothing to do with the token.
+
+    An absent field means "unknown" and must not be enforced. A field that IS
+    reported must still be enforced, or the gate becomes decoration.
+    """
+    print("test 10: momentum gates ignore fields the source did not report")
+    import filters
+
+    saved = (cfg.MIN_TXNS_H1, cfg.MIN_LIQUIDITY_USD, cfg.MIN_PRICE_CHANGE_H1_PCT,
+             cfg.MIN_CURVE_SOL, cfg.MAX_DEV_SHARE_PCT, cfg.MAX_TOP_HOLDER_PCT,
+             cfg.MIN_ROUND_TRIP_PCT, cfg.REQUIRE_MINT_RENOUNCED,
+             cfg.REQUIRE_FREEZE_RENOUNCED)
+    cfg.MIN_TXNS_H1, cfg.MIN_LIQUIDITY_USD, cfg.MIN_PRICE_CHANGE_H1_PCT = 2, 1000, 5
+    cfg.MIN_CURVE_SOL = cfg.MAX_DEV_SHARE_PCT = cfg.MAX_TOP_HOLDER_PCT = 0
+    cfg.MIN_ROUND_TRIP_PCT = 0
+    cfg.REQUIRE_MINT_RENOUNCED = cfg.REQUIRE_FREEZE_RENOUNCED = False
+    try:
+        base = {"mint": "M" * 43, "usd_market_cap": 5000}
+        ok, why = await filters.evaluate_token(dict(base))
+        check("a fresh mint with no DexScreener data passes", ok, why)
+
+        ok, why = await filters.evaluate_token(dict(base, txns_h1=1))
+        check("a REPORTED low txn count still rejects", not ok, why)
+        check("  and says so", "txns_h1 1" in why, why)
+
+        ok, why = await filters.evaluate_token(dict(base, txns_h1=0))
+        check("a reported ZERO txn count rejects (0 is data, not absence)",
+              not ok, why)
+
+        ok, why = await filters.evaluate_token(dict(base, liquidity_usd=10))
+        check("reported thin liquidity still rejects", not ok, why)
+
+        ok, why = await filters.evaluate_token(dict(base, price_change_h1=-20))
+        check("reported negative momentum still rejects", not ok, why)
+
+        ok, why = await filters.evaluate_token(dict(base, txns_24h=1))
+        check("txns_24h is used when txns_h1 is absent", not ok, why)
+    finally:
+        (cfg.MIN_TXNS_H1, cfg.MIN_LIQUIDITY_USD, cfg.MIN_PRICE_CHANGE_H1_PCT,
+         cfg.MIN_CURVE_SOL, cfg.MAX_DEV_SHARE_PCT, cfg.MAX_TOP_HOLDER_PCT,
+         cfg.MIN_ROUND_TRIP_PCT, cfg.REQUIRE_MINT_RENOUNCED,
+         cfg.REQUIRE_FREEZE_RENOUNCED) = saved
+
+
+async def test_curve_sol_gate():
+    """MIN_CURVE_SOL replaces MIN_TXNS_H1 as the momentum gate.
+
+    real_sol_reserves is in every pump.fun payload, so unlike txns_h1 it is
+    actually readable on a fresh mint - and it predicts exitability: probed over
+    20 launches, 8 of 12 tokens below 0.1 SOL had NO Jupiter sell route at all,
+    while 8 of 8 at or above 0.1 SOL were sellable.
+    """
+    print("test 10b: the curve-SOL gate reads real_sol_reserves")
+    import filters
+
+    saved = (cfg.MIN_CURVE_SOL, cfg.MIN_TXNS_H1, cfg.MAX_DEV_SHARE_PCT,
+             cfg.MAX_TOP_HOLDER_PCT, cfg.MIN_ROUND_TRIP_PCT,
+             cfg.REQUIRE_MINT_RENOUNCED, cfg.REQUIRE_FREEZE_RENOUNCED)
+    cfg.MIN_CURVE_SOL = 0.1
+    cfg.MIN_TXNS_H1 = cfg.MAX_DEV_SHARE_PCT = cfg.MAX_TOP_HOLDER_PCT = 0
+    cfg.MIN_ROUND_TRIP_PCT = 0
+    cfg.REQUIRE_MINT_RENOUNCED = cfg.REQUIRE_FREEZE_RENOUNCED = False
+    try:
+        base = {"mint": "M" * 43, "usd_market_cap": 5000}
+        check("0.03 SOL in the curve is below the floor",
+              filters.curve_sol({"real_sol_reserves": 30_000_000}) == 0.03)
+        check("an absent field reads as unknown, not zero",
+              filters.curve_sol({}) is None)
+
+        ok, why = await filters.evaluate_token(
+            dict(base, real_sol_reserves=30_000_000))
+        check("a token with 0.03 SOL in the curve is rejected", not ok, why)
+        check("  and the reason names the curve", "curve 0.030 SOL" in why, why)
+
+        ok, why = await filters.evaluate_token(
+            dict(base, real_sol_reserves=500_000_000))
+        check("a token with 0.5 SOL in the curve passes", ok, why)
+
+        ok, why = await filters.evaluate_token(dict(base))
+        check("a meta without the field is not rejected by this gate", ok, why)
+    finally:
+        (cfg.MIN_CURVE_SOL, cfg.MIN_TXNS_H1, cfg.MAX_DEV_SHARE_PCT,
+         cfg.MAX_TOP_HOLDER_PCT, cfg.MIN_ROUND_TRIP_PCT,
+         cfg.REQUIRE_MINT_RENOUNCED, cfg.REQUIRE_FREEZE_RENOUNCED) = saved
+
+
+async def test_dev_share_gate():
+    """The anti-rug gate that survives the RPC outage.
+
+    getTokenLargestAccounts is refused by every free endpoint (429/403/400/521/
+    402), so MAX_TOP_HOLDER_PCT reports unavailable on essentially every token.
+    check_dev_share() asks the same question - can one wallet dump the float? -
+    using getTokenAccountBalance, which those endpoints do answer (24 of 25 in a
+    live probe at real scan rate).
+    """
+    print("test 10c: the dev-share gate catches a creator holding the float")
+    import filters
+
+    saved = (cfg.MAX_DEV_SHARE_PCT, cfg.RUG_CHECK_FAIL_OPEN)
+    cfg.MAX_DEV_SHARE_PCT, cfg.RUG_CHECK_FAIL_OPEN = 40, False
+
+    # Real base58 keys: derive_ata() rejects placeholder strings.
+    m = {"mint": "So11111111111111111111111111111111111111112",
+         "creator": "11111111111111111111111111111111",
+         "token_program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+         "real_token_reserves": filters.CURVE_INITIAL_TOKENS - 1_000_000}
+
+    def rpc_returning(amount):
+        async def _rpc(payload, timeout=10.0):
+            return {"result": {"value": {"amount": str(amount)}}}
+        return _rpc
+
+    real_post = filters.post_rpc
+    try:
+        filters.post_rpc = rpc_returning(600_000)          # 60% of sold float
+        ok, why = await filters.check_dev_share(m)
+        check("a dev holding 60% of the float is rejected", not ok, why)
+        check("  and the reason is quantified", "dev holds 60%" in why, why)
+
+        filters.post_rpc = rpc_returning(100_000)          # 10%
+        ok, why = await filters.check_dev_share(m)
+        check("a dev holding 10% passes", ok, why)
+
+        async def rpc_no_account(payload, timeout=10.0):
+            return {"error": {"code": -32602, "message": "could not find account"}}
+
+        filters.post_rpc = rpc_no_account
+        ok, why = await filters.check_dev_share(m)
+        check("a creator with no token account passes (holds nothing)", ok, why)
+
+        ok, why = await filters.check_dev_share(
+            dict(m, real_token_reserves=filters.CURVE_INITIAL_TOKENS))
+        check("nothing sold yet -> nothing to dump -> pass", ok, why)
+
+        ok, why = await filters.check_dev_share({"mint": m["mint"]})
+        check("a payload without a creator cannot be judged -> pass", ok, why)
+    finally:
+        filters.post_rpc = real_post
+        cfg.MAX_DEV_SHARE_PCT, cfg.RUG_CHECK_FAIL_OPEN = saved
+
+
+async def test_rug_check_fails_closed():
+    """An unreachable RPC must not silently disable the anti-rug layer.
+
+    The old code caught the exception, printed "holder check unavailable" and
+    returned PASS. With every free endpoint refusing the call, that turned
+    MAX_TOP_HOLDER_PCT into decoration: one live run logged the message on
+    essentially every token and recorded zero holder rejections. Unknown is not
+    safe, so the default is now fail-closed.
+    """
+    print("test 10d: an unreachable rug check skips the token, not the check")
+    import filters
+    import httpx
+
+    saved = (cfg.MAX_TOP_HOLDER_PCT, cfg.MAX_DEV_SHARE_PCT,
+             cfg.RUG_CHECK_FAIL_OPEN)
+    cfg.MAX_TOP_HOLDER_PCT, cfg.MAX_DEV_SHARE_PCT = 60, 40
+
+    async def rpc_down(payload, timeout=10.0):
+        raise httpx.ConnectError("all endpoints refused")
+
+    real_post = filters.post_rpc
+    filters.post_rpc = rpc_down
+    try:
+        cfg.RUG_CHECK_FAIL_OPEN = False
+        ok, why = await filters.check_holder_concentration("M" * 43)
+        check("holder check fails CLOSED by default", not ok, why)
+        check("  and names the real exception type", "ConnectError" in why, why)
+
+        ok, why = await filters.check_dev_share({
+            "mint": "So11111111111111111111111111111111111111112",
+            "creator": "11111111111111111111111111111111",
+            "token_program": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "real_token_reserves": filters.CURVE_INITIAL_TOKENS - 1_000_000})
+        check("dev-share check fails CLOSED by default", not ok, why)
+
+        cfg.RUG_CHECK_FAIL_OPEN = True
+        ok, _ = await filters.check_holder_concentration("M" * 43)
+        check("RUG_CHECK_FAIL_OPEN=true restores the old permissive path", ok)
+    finally:
+        filters.post_rpc = real_post
+        (cfg.MAX_TOP_HOLDER_PCT, cfg.MAX_DEV_SHARE_PCT,
+         cfg.RUG_CHECK_FAIL_OPEN) = saved
+
+
+async def test_free_gates_run_before_paid_ones():
+    """Gate order is a budget decision, not cosmetics.
+
+    A token rejected on the listing payload must not first spend an RPC call and
+    two Jupiter quotes. With 27k tokens per run that ordering is the difference
+    between a working scanner and a rate-limited one.
+    """
+    print("test 10e: a payload-rejectable token spends no network calls")
+    import filters
+
+    saved = (cfg.MAX_MARKET_CAP_USD, cfg.MIN_CURVE_SOL, cfg.MAX_DEV_SHARE_PCT,
+             cfg.MAX_TOP_HOLDER_PCT, cfg.MIN_ROUND_TRIP_PCT,
+             cfg.REQUIRE_MINT_RENOUNCED, cfg.REQUIRE_FREEZE_RENOUNCED)
+    cfg.MAX_MARKET_CAP_USD, cfg.MIN_CURVE_SOL = 30000, 0.1
+    cfg.MAX_DEV_SHARE_PCT = cfg.MAX_TOP_HOLDER_PCT = 60
+    cfg.MIN_ROUND_TRIP_PCT = 80
+    cfg.REQUIRE_MINT_RENOUNCED = cfg.REQUIRE_FREEZE_RENOUNCED = True
+
+    calls = []
+
+    async def counting_rpc(payload, timeout=10.0):
+        calls.append(payload.get("method"))
+        return {"result": {"value": None}}
+
+    real_post = filters.post_rpc
+    filters.post_rpc = counting_rpc
+    try:
+        ok, why = await filters.evaluate_token(
+            {"mint": "M" * 43, "usd_market_cap": 99999,
+             "real_sol_reserves": 500_000_000})
+        check("an over-cap token is rejected", not ok, why)
+        check("  without any RPC call", calls == [], calls)
+
+        ok, why = await filters.evaluate_token(
+            {"mint": "M" * 43, "usd_market_cap": 5000,
+             "real_sol_reserves": 1_000_000})
+        check("a thin-curve token is rejected", not ok, why)
+        check("  also without any RPC call", calls == [], calls)
+    finally:
+        filters.post_rpc = real_post
+        (cfg.MAX_MARKET_CAP_USD, cfg.MIN_CURVE_SOL, cfg.MAX_DEV_SHARE_PCT,
+         cfg.MAX_TOP_HOLDER_PCT, cfg.MIN_ROUND_TRIP_PCT,
+         cfg.REQUIRE_MINT_RENOUNCED, cfg.REQUIRE_FREEZE_RENOUNCED) = saved
+
+
 async def main():
     await test_ws_dedup()
     await test_ws_fallback_rpc()
@@ -1146,6 +1383,11 @@ async def main():
     await test_authority_lookup_uses_confirmed_commitment()
     await test_foreign_program_blob_is_not_a_pumpfun_event()
     await test_maintenance_events_are_recognised()
+    await test_absent_momentum_field_is_not_zero()
+    await test_curve_sol_gate()
+    await test_dev_share_gate()
+    await test_rug_check_fails_closed()
+    await test_free_gates_run_before_paid_ones()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} FAILED: {FAILURES}")

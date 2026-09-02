@@ -3,6 +3,10 @@ filters.py - Decide whether a freshly detected token is worth sniping.
 
 We keep this cheap and on-chain-only so it runs fast. Heavy LLM analysis
 (Claude Opus) is OUT of scope here; this is the raw safety/quality gate.
+
+Gate ordering is deliberate: every check that reads the listing payload runs
+before any check that costs an RPC call or a Jupiter quote, so a token rejected
+on free data never spends network budget.
 """
 import time
 
@@ -12,6 +16,47 @@ from rpc import post_rpc
 # pump.fun bonding curve program - a token is "pre-graduation" while it still
 # lives on the curve. We approximate by checking the listing metadata flags.
 PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# Associated Token Account program - needed to derive the creator's token account
+# from (creator, mint) without an extra lookup.
+ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+
+# Tokens the bonding curve starts with, in base units (6 decimals). The rest of
+# the 1B supply is reserved for the post-graduation pool. Sold float =
+# CURVE_INITIAL_TOKENS - real_token_reserves.
+CURVE_INITIAL_TOKENS = 793_100_000 * 10**6
+
+# Lamports per SOL.
+LAMPORTS = 10**9
+
+
+def curve_sol(meta: dict) -> float | None:
+    """SOL currently held by the bonding curve, or None if the source omits it.
+
+    None means "unknown", not "zero". The pump.fun listing/coin payload always
+    carries real_sol_reserves, but the DexScreener fallback (used when pump.fun
+    5xxs) does not - and for those metas MIN_LIQUIDITY_USD is the equivalent
+    gate. Collapsing absent to 0 here would rebuild the exact bug this gate
+    replaces.
+    """
+    raw = meta.get("real_sol_reserves")
+    return None if raw is None else float(raw) / LAMPORTS
+
+
+def _unavailable(what: str, err) -> tuple[bool, str]:
+    """Verdict for a rug check that could not reach any RPC endpoint.
+
+    Fail-closed by default: an unknown answer is not a safe answer, and these
+    gates exist precisely for the tokens most likely to break them. The old
+    fail-open silently disabled the whole anti-rug layer - one run logged
+    "holder check unavailable" on essentially every token while reporting no
+    rejections at all.
+    """
+    reason = f"{what} unavailable ({type(err).__name__})"
+    if cfg.RUG_CHECK_FAIL_OPEN:
+        print(f"    [filter] {reason} - allowing (RUG_CHECK_FAIL_OPEN)")
+        return (True, reason)
+    return (False, reason)
 
 
 async def get_mint_account_info(mint: str) -> dict:
@@ -66,8 +111,11 @@ async def evaluate_token(meta: dict) -> tuple[bool, str]:
     """
     meta: a dict from the pump.fun listing API (or normalized equivalent).
     Returns (passed, reason). reason explains the first failure or 'OK'.
+
+    Free payload checks first, then one RPC (authority), then the rug checks,
+    then two Jupiter quotes. Cheapest rejection wins.
     """
-    # Socials check
+    # --- Free: everything the listing payload already answers ---------------
     if cfg.REQUIRE_SOCIALS:
         has_website = bool(meta.get("website"))
         has_twitter = bool(meta.get("twitter"))
@@ -88,7 +136,38 @@ async def evaluate_token(meta: dict) -> tuple[bool, str]:
     if cfg.ONLY_PRE_GRADUATION and status is not None and int(status) != 0:
         return (False, "already graduated")
 
-    # On-chain authority checks (renounced = safe from mint/freeze scams)
+    # Real buying pressure, straight from the payload. Unlike txns_h1 this is
+    # always present on a fresh mint, and it predicts whether an exit exists.
+    csol = curve_sol(meta)
+    if cfg.MIN_CURVE_SOL and csol is not None and csol < cfg.MIN_CURVE_SOL:
+        return (False, f"curve {csol:.3f} SOL < min {cfg.MIN_CURVE_SOL:.3f}")
+
+    # DexScreener-derived momentum fields. Each is enforced ONLY when the source
+    # actually reported it: for a token seconds old DexScreener has no pair yet,
+    # and treating a missing field as 0 rejected 98.7% of all tokens scanned.
+    liq = meta.get("liquidity_usd")
+    if cfg.MIN_LIQUIDITY_USD and liq is not None and float(liq) < cfg.MIN_LIQUIDITY_USD:
+        return (False, f"liquidity {float(liq):.0f} < min {cfg.MIN_LIQUIDITY_USD:.0f}")
+
+    txns = meta.get("txns_h1")
+    if txns is None:
+        txns = meta.get("txns_24h")
+    if cfg.MIN_TXNS_H1 and txns is not None and int(txns) < cfg.MIN_TXNS_H1:
+        return (False, f"txns_h1 {int(txns)} < min {cfg.MIN_TXNS_H1}")
+
+    pchg = meta.get("price_change_h1")
+    if (cfg.MIN_PRICE_CHANGE_H1_PCT and pchg is not None
+            and float(pchg) < cfg.MIN_PRICE_CHANGE_H1_PCT):
+        return (False, f"price h1 {float(pchg):.1f}% < "
+                       f"min {cfg.MIN_PRICE_CHANGE_H1_PCT:.1f}%")
+
+    created = int(meta.get("pair_created_at") or 0)
+    if cfg.MIN_PAIR_AGE_SEC and created:
+        age = (int(time.time() * 1000) - created) / 1000.0
+        if age < cfg.MIN_PAIR_AGE_SEC:
+            return (False, f"pair too new ({age:.0f}s < {cfg.MIN_PAIR_AGE_SEC}s)")
+
+    # --- One RPC call: mint/freeze authority renounced? ----------------------
     mint = meta.get("mint")
     if cfg.REQUIRE_MINT_RENOUNCED or cfg.REQUIRE_FREEZE_RENOUNCED:
         if not mint:
@@ -109,26 +188,12 @@ async def evaluate_token(meta: dict) -> tuple[bool, str]:
         except Exception as e:
             return (False, f"authority check error: {e}")
 
-    # --- Advanced quality filters (reduce rug exposure) ---
-    liq = float(meta.get("liquidity_usd") or 0)
-    if cfg.MIN_LIQUIDITY_USD and liq < cfg.MIN_LIQUIDITY_USD:
-        return (False, f"liquidity {liq:.0f} < min {cfg.MIN_LIQUIDITY_USD:.0f}")
+    # --- Anti-rug: can one wallet dump the whole float? ---------------------
+    if cfg.MAX_DEV_SHARE_PCT and mint:
+        ok, why = await check_dev_share(meta)
+        if not ok:
+            return (False, why)
 
-    txns = int(meta.get("txns_h1") or meta.get("txns_24h") or 0)
-    if cfg.MIN_TXNS_H1 and txns < cfg.MIN_TXNS_H1:
-        return (False, f"txns_h1 {txns} < min {cfg.MIN_TXNS_H1}")
-
-    pchg = float(meta.get("price_change_h1") or 0)
-    if cfg.MIN_PRICE_CHANGE_H1_PCT and pchg < cfg.MIN_PRICE_CHANGE_H1_PCT:
-        return (False, f"price h1 {pchg:.1f}% < min {cfg.MIN_PRICE_CHANGE_H1_PCT:.1f}%")
-
-    created = int(meta.get("pair_created_at") or 0)
-    if cfg.MIN_PAIR_AGE_SEC and created:
-        age = (int(time.time() * 1000) - created) / 1000.0
-        if age < cfg.MIN_PAIR_AGE_SEC:
-            return (False, f"pair too new ({age:.0f}s < {cfg.MIN_PAIR_AGE_SEC}s)")
-
-    # --- Anti-rug: holder concentration -------------------------------------
     if cfg.MAX_TOP_HOLDER_PCT and mint:
         ok, why = await check_holder_concentration(mint)
         if not ok:
@@ -147,6 +212,66 @@ async def evaluate_token(meta: dict) -> tuple[bool, str]:
     return (True, "OK")
 
 
+async def check_dev_share(meta: dict) -> tuple[bool, str]:
+    """Reject a token whose creator still holds most of the sold float.
+
+    This is the working substitute for check_holder_concentration: same threat
+    model (one wallet able to dump the entire float in a single tx), but priced
+    in one getTokenAccountBalance on the creator's derived ATA instead of
+    getTokenLargestAccounts, which no reachable RPC endpoint serves.
+
+    "Sold float" is what buyers have actually taken off the curve
+    (CURVE_INITIAL_TOKENS - real_token_reserves), so the ratio answers the
+    question that matters: of the tokens in circulation, how many can the dev
+    dump? A creator with no token account at all holds nothing - that is a PASS,
+    and it is the common case (7 of 15 sampled launches).
+
+    Fails closed on RPC failure by default; see _unavailable().
+    """
+    mint, creator = meta.get("mint"), meta.get("creator")
+    token_program = meta.get("token_program")
+    if not (creator and token_program):
+        return (True, "dev share unknown (payload has no creator)")
+
+    sold = CURVE_INITIAL_TOKENS - float(meta.get("real_token_reserves") or 0)
+    if sold <= 0:
+        return (True, "OK")  # nothing in circulation yet - nothing to dump
+
+    try:
+        ata = derive_ata(creator, mint, token_program)
+        body = await post_rpc({
+            "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountBalance",
+            "params": [ata, {"commitment": cfg.RPC_COMMITMENT}],
+        })
+    except Exception as e:
+        return _unavailable("dev share check", e)
+
+    if body.get("error"):
+        # No such account => the creator never received (or already moved) any
+        # tokens. Not an error condition for us.
+        return (True, "OK")
+
+    held = float((body.get("result") or {}).get("value", {}).get("amount") or 0)
+    pct = held / sold * 100
+    if pct > cfg.MAX_DEV_SHARE_PCT:
+        return (False, f"dev holds {pct:.0f}% of float > "
+                       f"max {cfg.MAX_DEV_SHARE_PCT:.0f}%")
+    return (True, "OK")
+
+
+def derive_ata(owner: str, mint: str, token_program: str) -> str:
+    """Associated Token Account address for (owner, mint) under token_program."""
+    from solders.pubkey import Pubkey
+
+    addr, _ = Pubkey.find_program_address(
+        [bytes(Pubkey.from_string(owner)),
+         bytes(Pubkey.from_string(token_program)),
+         bytes(Pubkey.from_string(mint))],
+        Pubkey.from_string(ATA_PROGRAM),
+    )
+    return str(addr)
+
+
 async def check_holder_concentration(mint: str) -> tuple[bool, str]:
     """Reject a token whose supply is concentrated in one non-curve wallet.
 
@@ -155,16 +280,16 @@ async def check_holder_concentration(mint: str) -> tuple[bool, str]:
     in one transaction. The bonding curve itself is excluded - it legitimately
     holds the unsold supply pre-graduation.
 
-    One RPC call (getTokenLargestAccounts). Fails OPEN on error: a flaky RPC
-    should not silently block every entry.
+    One RPC call (getTokenLargestAccounts) - which every free endpoint currently
+    refuses, so in practice this gate reports unavailable and check_dev_share is
+    what protects the entry. Kept for when a paid RPC key is configured.
     """
     payload = {"jsonrpc": "2.0", "id": 1, "method": "getTokenLargestAccounts",
-               "params": [mint, {"commitment": "confirmed"}]}
+               "params": [mint, {"commitment": cfg.RPC_COMMITMENT}]}
     try:
         accounts = (await post_rpc(payload)).get("result", {}).get("value") or []
     except Exception as e:
-        print(f"    [filter] holder check unavailable ({e}) - allowing")
-        return (True, "holder check skipped")
+        return _unavailable("holder check", e)
 
     amounts = sorted((float(a.get("uiAmount") or 0) for a in accounts), reverse=True)
     if len(amounts) < 2:

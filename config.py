@@ -120,8 +120,25 @@ class Config:
     # --- Advanced quality filters (reduce rug exposure) ---
     # Require a minimum on-chain liquidity (USD). Thin liquidity = easy rug.
     MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "0"))
+    # Minimum SOL sitting in the bonding curve, read from the listing payload's
+    # real_sol_reserves. This is the momentum/liquidity gate that actually works
+    # on a fresh mint, because the value is always present.
+    #
+    # It replaces MIN_TXNS_H1 as the primary gate. txns_h1/liquidity_usd/
+    # price_change_h1/pair_created_at come from DexScreener, and DexScreener has
+    # no pair for a token seconds old: measured on 30 consecutive launches, all
+    # four fields were absent 30/30 while usd_market_cap was present 30/30. The
+    # old `int(meta.get("txns_h1") or 0)` therefore evaluated to 0 for every
+    # token, so MIN_TXNS_H1=2 rejected 26928 of 27278 tokens (98.7%) in one run
+    # for a reason that had nothing to do with the token.
+    #
+    # Curve SOL also predicts exitability, which txn count never did. Over 20
+    # consecutive launches: below 0.1 SOL, 8 of 12 tokens had NO Jupiter sell
+    # route at all; at or above 0.1 SOL, 8 of 8 were sellable.
+    MIN_CURVE_SOL = float(os.getenv("MIN_CURVE_SOL", "0"))
     # Require a minimum txn count in the LAST HOUR (real interest / momentum).
-    # Token baru pump.fun belum punya history 24h, jadi pakai h1.
+    # Only enforced when the discovery source actually reports the field - an
+    # absent field means "unknown", not "zero". See MIN_CURVE_SOL.
     MIN_TXNS_H1 = int(os.getenv("MIN_TXNS_H1", "0"))
     # Require price to be UP over the last hour (momentum). 0 = no check.
     MIN_PRICE_CHANGE_H1_PCT = float(os.getenv("MIN_PRICE_CHANGE_H1_PCT", "0"))
@@ -132,7 +149,30 @@ class Config:
     # Max share of the circulating float (bonding curve excluded) a single
     # wallet may hold. A dev/bundle holding most of the float can dump it in one
     # tx. 0 disables the check (and saves one RPC call per token).
+    #
+    # NOTE: this gate needs getTokenLargestAccounts, which no reachable endpoint
+    # currently serves (probed: mainnet-beta 429, publicnode 403, drpc 400,
+    # omniatech 521, onfinality 429, blockeden 402, and the Helius key is spent).
+    # It therefore fails open on essentially every token - the log fills with
+    # "holder check unavailable" - so MAX_DEV_SHARE_PCT below is the gate that
+    # actually bites. Keep this one configured for when a paid RPC key returns.
     MAX_TOP_HOLDER_PCT = float(os.getenv("MAX_TOP_HOLDER_PCT", "0"))
+    # Max share of the SOLD float the creator's own wallet may hold. Same threat
+    # as MAX_TOP_HOLDER_PCT (one wallet able to dump the whole float) but priced
+    # in one getTokenAccountBalance on the creator's derived ATA - a call the
+    # free endpoints do serve: 24 of 25 answered in a live probe at the bot's
+    # real scan rate (3.9 calls/s), the miss being one transient HTTP error.
+    #
+    # Threshold from data, not taste: across 15 curve-eligible launches the
+    # median dev share was 1.1% and 7 devs held nothing, while the rug shapes sat
+    # at 50-324% of sold float. Anything in 20-50 rejects the same 6 tokens, so
+    # 40 sits in the middle of that plateau. 0 disables.
+    MAX_DEV_SHARE_PCT = float(os.getenv("MAX_DEV_SHARE_PCT", "0"))
+    # What to do when a rug check cannot reach any RPC endpoint. false (default)
+    # = treat unknown as unsafe and skip the token, matching the live-execution
+    # rule that an unknown balance blocks a buy. Setting this true restores the
+    # old fail-open behaviour, which silently disabled the anti-rug gates.
+    RUG_CHECK_FAIL_OPEN = _bool(os.getenv("RUG_CHECK_FAIL_OPEN", "false"))
     # Minimum % of BUY_AMOUNT_SOL recoverable by immediately selling back.
     # Catches honeypots (no sell route at all) and liquidity too thin to exit.
     # Healthy pump.fun tokens sit around 88-95%. 0 disables (2 quotes per token).
