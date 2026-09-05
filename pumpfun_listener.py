@@ -4,6 +4,8 @@ tokens, newest first. This is a simple, robust polling approach (no websocket
 reverse-engineering needed). Poll interval is configurable.
 """
 import asyncio
+import re
+
 import httpx
 from config import cfg
 
@@ -14,17 +16,45 @@ async def fetch_new_tokens(limit: int = 30) -> list[dict]:
     Each dict has keys like: mint, name, symbol, website, twitter, telegram,
     usd_market_cap, status, created_timestamp, etc.
     """
-    url = f"https://frontend-api.pump.fun/coins?offset=0&limit={limit}&sort=created"
+    url = cfg.PUMPFUN_LISTING_URL
+    # Honour the caller's limit even though the configured URL carries its own.
+    if "limit=" in url and limit != 30:
+        url = re.sub(r"limit=\d+", f"limit={limit}", url)
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         data = r.json()
     # API returns either a list or {"coins": [...]}
     if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and "coins" in data:
-        return data["coins"]
-    return []
+        coins = data
+    elif isinstance(data, dict) and "coins" in data:
+        coins = data["coins"]
+    else:
+        coins = []
+    return [_normalize_pumpfun(c) for c in coins]
+
+
+def _normalize_pumpfun(t: dict) -> dict:
+    """
+    Bring a pump.fun v3 payload up to the shape filters.py expects.
+
+    v3 differences from the old frontend-api:
+      * no `status` field -> graduation is the `complete` boolean
+      * no `telegram` field -> only website/twitter are published
+      * market cap may arrive as market_cap_usd instead of usd_market_cap
+    """
+    if not isinstance(t, dict):
+        return t
+    if t.get("status") is None and "complete" in t:
+        t["status"] = 1 if t.get("complete") else 0
+    # v3 omits these keys entirely on some coins; filters.py uses .get() but
+    # downstream code and tests are easier to reason about with them present.
+    t.setdefault("website", None)
+    t.setdefault("twitter", None)
+    t.setdefault("telegram", None)
+    if not t.get("usd_market_cap") and t.get("market_cap_usd"):
+        t["usd_market_cap"] = t["market_cap_usd"]
+    return t
 
 
 async def fetch_token_meta(mint: str) -> dict | None:
@@ -36,16 +66,16 @@ async def fetch_token_meta(mint: str) -> dict | None:
         mint, name, symbol, website, twitter, telegram, usd_market_cap, status
     or None.
     """
-    # --- Primary: pump.fun (kept for when the block is lifted) ---
+    # --- Primary: pump.fun (v3 host; old host is Cloudflare-blocked) ---
     try:
-        url = f"https://frontend-api.pump.fun/coins/{mint}"
+        url = f"{cfg.PUMPFUN_COIN_URL}/{mint}"
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 404:
                 return None
             if r.status_code < 500:
                 r.raise_for_status()
-                return r.json()
+                return _normalize_pumpfun(r.json())
             # 5xx (Cloudflare 530 etc) -> fall through to DexScreener
     except Exception:
         pass

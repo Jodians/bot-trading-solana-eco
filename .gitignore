@@ -1,5 +1,8 @@
 # Secrets / env
 .env
+# A pre-edit snapshot of .env, so it holds the SAME secrets (Helius key, Telegram
+# token, wallet key). Written by the one-key .env edit script.
+.env.bak
 
 # Python caches
 __pycache__/
@@ -9,13 +12,42 @@ venv/
 
 # Runtime artifacts (logs)
 *.log
+# Rotated logs (dashboard.log -> dashboard.log.1 past ~20 MB). The bare *.log
+# glob does NOT match these, so a 15 MB rotated log kept showing up as untracked.
+*.log.[0-9]
 push.log
 solana-bot.log
+
+# Supervisor single-instance lock (machine-local)
+run_dashboard.lock
+
+# Runtime state: open positions held by THIS machine's wallet. Machine-specific
+# and privacy-sensitive (reveals holdings) - never commit it.
+positions.json
+.positions-*.tmp
+# Throwaway snapshots of positions.json taken while probing the launcher.
+positions.json.probe-*
+
+# Watchdog state (cron job solana_watch.py): line counts, crash tally and the
+# de-dup alert set. Machine-local, rewritten every 15 min.
+watch_state.json
 
 # Test/debug scratch
 _test_*.py
 _dbg.py
 _syntaxcheck.py
+# Throwaway probes (RPC/discovery/event tallies) - written to be deleted
+_*probe*.py
+_e2e_check.py
+_flip_ws.py
+_listener_check.py
+_v3_shape.py
+
+# Wallet-study artifacts: per-signature tx cache (thousands of files) and
+# generated study output. Regenerate with tools/wallet_study.py.
+tools/.wallet_cache/
+tools/wallet_study*.json
+tools/*_survey.json
 
 # Local backups / pre-restart snapshots
 *.bak-*

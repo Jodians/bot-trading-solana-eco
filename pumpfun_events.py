@@ -41,9 +41,45 @@ TRADE_EVENT = _discriminator("TradeEvent")
 COMPLETE_EVENT = _discriminator("CompleteEvent")
 SET_PARAMS_EVENT = _discriminator("SetParamsEvent")
 
+# pump.fun program id (constant on mainnet). Lives here rather than in
+# ws_listener because blob attribution (below) needs it.
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+
+# Every other event the program is known to emit. None of these is a launch, so
+# recognising them keeps has_unknown_event() from paying for a getTransaction.
+# The original four were not enough: sampling live pump.fun transactions turned
+# up ExtendAccountEvent and CloseUserVolumeAccumulatorEvent among them, and with
+# only four tags recognised 83% of event-carrying frames looked "possibly a
+# launch" - which is what produced 7358 `enrich queue full` lines in one run.
+_OTHER_EVENT_NAMES = (
+    "ExtendAccountEvent",
+    "CloseUserVolumeAccumulatorEvent",
+    "SyncUserVolumeAccumulatorEvent",
+    "CompletePumpAmmMigrationEvent",
+    "CollectCreatorFeeEvent",
+    "SetCreatorEvent",
+    "SetMetaplexCreatorEvent",
+    "UpdateGlobalAuthorityEvent",
+    "AdminSetCreatorEvent",
+    "AdminUpdateTokenIncentivesEvent",
+    "ClaimTokenIncentivesEvent",
+)
+
+# Tags observed live, repeatedly, in transactions that created nothing, but whose
+# event name we could not recover (a discriminator is a one-way hash; 1950
+# candidate names were brute-forced without a match). Listing the raw tag is
+# still correct: the ONLY purpose of KNOWN_EVENTS is "definitely not a launch,
+# do not spend an RPC call". A real CreateEvent decodes directly, so a stable,
+# high-frequency non-create tag belongs here regardless of its name.
+_OBSERVED_NON_CREATE_TAGS = (
+    bytes.fromhex("e2d6f62107f293e5"),  # 25 occurrences, 0 creates
+)
+
 # Events we recognise and can therefore dismiss without fetching the tx.
 KNOWN_EVENTS = frozenset(
     (CREATE_EVENT, TRADE_EVENT, COMPLETE_EVENT, SET_PARAMS_EVENT)
+    + tuple(_discriminator(n) for n in _OTHER_EVENT_NAMES)
+    + _OBSERVED_NON_CREATE_TAGS
 )
 
 
@@ -94,6 +130,44 @@ def iter_program_data(logs):
             continue
 
 
+def iter_pumpfun_program_data(logs):
+    """Yield only the `Program data:` payloads pump.fun itself emitted.
+
+    Solana interleaves inner CPI programs into one flat log list, so a router, a
+    fee hook or the pump AMM can drop its own event blob into a pump.fun
+    transaction. To has_unknown_event() such a blob is indistinguishable from an
+    unrecognised pump.fun event, and it then buys a getTransaction call for a tx
+    that created nothing.
+
+    Attribution walks the `Program <id> invoke [depth]` / `Program <id> success`
+    markers to track which program is executing. A blob emitted while no program
+    is on the stack cannot be attributed, so it is yielded (conservative: better
+    to pay for one RPC call than to miss a launch).
+    """
+    stack: list[str] = []
+    for line in logs or []:
+        if line.startswith("Program ") and " invoke [" in line:
+            parts = line.split()
+            if len(parts) >= 2:
+                stack.append(parts[1])
+            continue
+        if line.startswith("Program ") and (
+            line.endswith(" success") or " failed" in line
+        ):
+            if stack:
+                stack.pop()
+            continue
+        if not line.startswith(LOG_DATA_PREFIX):
+            continue
+        if stack and stack[-1] != PUMP_PROGRAM:
+            continue  # someone else's event, riding along in this transaction
+        blob = line[len(LOG_DATA_PREFIX):].strip()
+        try:
+            yield base64.b64decode(blob + "=" * (-len(blob) % 4))
+        except Exception:
+            continue
+
+
 def decode_create_event(payload: bytes) -> dict | None:
     """Return {name, symbol, uri, mint, bonding_curve, user} or None.
 
@@ -131,13 +205,24 @@ def extract_new_mint(logs) -> dict | None:
 
 
 def has_unknown_event(logs) -> bool:
-    """True if a `Program data:` blob carries a discriminator we do not know.
+    """True if this frame *might* be a launch we failed to decode.
 
-    Callers use this to decide whether a frame is worth an RPC fallback: a
-    recognised non-create event (a trade, a curve completion) is definitively
-    *not* a launch, so fetching the transaction would be wasted. An unknown tag
-    means the program was upgraded and we should not silently miss the launch.
+    Used to decide whether a frame is worth an RPC fallback. Three ways to be
+    sure it is not worth one:
+
+      * the blob belongs to a DIFFERENT program - inner CPI programs (routers,
+        fee hooks, the pump AMM) write their own event data into the same flat
+        log list, and those tell us nothing about a pump.fun launch. Only blobs
+        attributed to pump.fun are considered.
+      * it carries a recognised event (TradeEvent / CompleteEvent / SetParams /
+        the account-maintenance events) - those are definitively not launches.
+        This is the common case by a wide margin.
+      * every blob is recognised - nothing to resolve.
+
+    Only a frame whose pump.fun blobs are *entirely* unrecognised suggests the
+    program was upgraded and a launch could be hiding in it.
     """
-    return any(
-        len(p) >= 8 and p[:8] not in KNOWN_EVENTS for p in iter_program_data(logs)
-    )
+    payloads = [p for p in iter_pumpfun_program_data(logs) if len(p) >= 8]
+    if not payloads:
+        return False
+    return all(p[:8] not in KNOWN_EVENTS for p in payloads)
